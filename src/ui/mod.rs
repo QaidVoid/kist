@@ -1,5 +1,3 @@
-#![allow(dead_code)] // entry `render` consumed by main in a later task group
-
 //! Terminal UI rendering.
 //!
 //! [`render`] is the single entry point: given a frame and the [`App`], it lays

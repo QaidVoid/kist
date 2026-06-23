@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by main/UI in later task groups
-
 //! Terminal application state machine.
 //!
 //! [`App`] holds the UI state (current mode, selection, input buffer, latest

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by engine/main in later task groups
-
 //! User configuration loading and persistence.
 
 use std::path::{Path, PathBuf};

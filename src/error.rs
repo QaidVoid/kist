@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by engine/main in later task groups
-
 //! Error handling helpers.
 
 /// Convenience alias used throughout the application.

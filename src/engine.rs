@@ -1,5 +1,3 @@
-#![allow(dead_code)] // public API consumed by main in a later task group
-
 //! librqbit session wrapper and command handling.
 //!
 //! The [`Engine`] owns the librqbit [`Session`] and exposes thin async methods
@@ -138,7 +136,7 @@ fn mbps_to_bytes(mbps: f64) -> u64 {
 }
 
 /// Commands the UI sends to the engine.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
     /// Add a torrent from the given source string.
     Add(String),
