@@ -60,6 +60,8 @@ pub struct App {
     pub selected: usize,
     /// Current contents of the add-torrent input bar.
     pub input: String,
+    /// Byte offset of the editing cursor within [`App::input`].
+    pub cursor: usize,
     /// Latest snapshot received from the engine.
     pub snapshot: Snapshot,
     /// Latest status/error message to display, if any.
@@ -75,6 +77,7 @@ impl App {
             mode: Mode::List,
             selected: 0,
             input: String::new(),
+            cursor: 0,
             snapshot: Snapshot::default(),
             status: None,
             status_is_error: false,
@@ -104,9 +107,9 @@ impl App {
             Event::Tick => Action::none(),
             Event::Input(CrosstermEvent::Key(key)) => self.handle_key(key),
             Event::Input(CrosstermEvent::Paste(text)) => {
-                // A bracketed paste: append the whole string to the add bar.
+                // A bracketed paste: insert the whole string at the cursor.
                 if self.mode == Mode::AddBar {
-                    self.input.push_str(&text);
+                    self.insert_str(&text);
                 }
                 Action::none()
             }
@@ -159,13 +162,13 @@ impl App {
     fn handle_add_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => {
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::List;
                 Action::none()
             }
             KeyCode::Enter => {
                 let source = self.input.trim().to_string();
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::List;
                 if source.is_empty() {
                     Action::none()
@@ -174,17 +177,33 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.backspace();
+                Action::none()
+            }
+            KeyCode::Left => {
+                self.move_left();
+                Action::none()
+            }
+            KeyCode::Right => {
+                self.move_right();
+                Action::none()
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                Action::none()
+            }
+            KeyCode::End => {
+                self.cursor = self.input.len();
                 Action::none()
             }
             KeyCode::Char(c) => {
-                // Append printable characters, including uppercase (Shift+char).
+                // Insert printable characters, including uppercase (Shift+char).
                 // Skip only control/alt combinations; Ctrl+C quits globally.
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 {
-                    self.input.push(c);
+                    self.insert_char(c);
                 }
                 Action::none()
             }
@@ -210,6 +229,62 @@ impl App {
         let max = self.snapshot.rows.len() - 1;
         let next = self.selected as i32 + delta;
         self.selected = next.clamp(0, max as i32) as usize;
+    }
+
+    /// Clear the add bar and reset the cursor to the start.
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert a character at the cursor and advance past it.
+    fn insert_char(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Insert a string at the cursor and advance past it.
+    fn insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    /// Delete the character immediately before the cursor.
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.prev_char_start();
+        self.input.replace_range(prev..self.cursor, "");
+        self.cursor = prev;
+    }
+
+    /// Move the cursor one character to the left.
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.prev_char_start();
+        }
+    }
+
+    /// Move the cursor one character to the right.
+    fn move_right(&mut self) {
+        if self.cursor < self.input.len() {
+            let adv = self.input[self.cursor..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+            self.cursor += adv;
+        }
+    }
+
+    /// Byte index of the start of the character immediately before the cursor.
+    fn prev_char_start(&self) -> usize {
+        self.input[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     fn cmd_for_selected(&self, make: fn(usize) -> Command) -> Action {
