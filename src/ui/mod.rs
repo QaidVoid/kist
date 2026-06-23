@@ -15,6 +15,7 @@ use crate::format::format_speed;
 use crate::model::AggregateStats;
 
 pub mod add_bar;
+pub mod confirm;
 pub mod help;
 pub mod list;
 
@@ -37,6 +38,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::AddBar => add_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
+        Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
         Mode::List => {}
     }
 }
@@ -94,6 +96,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints = match app.mode {
         Mode::AddBar => "enter: add  esc: cancel",
         Mode::Help => "esc / ?: close help",
+        Mode::ConfirmRemove { .. } => "y: remove  n / esc: cancel",
         Mode::List => "a:add  j/k:move  p:pause  r:resume  d:remove  ?:help  q:quit",
     };
     frame.render_widget(Line::raw(format!(" {hints}")), area);

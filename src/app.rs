@@ -24,6 +24,8 @@ pub enum Mode {
     AddBar,
     /// The help overlay is open.
     Help,
+    /// A confirmation dialog is open for removing the torrent with this id.
+    ConfirmRemove { id: usize },
 }
 
 /// A merged event fed to [`App::handle`] by the runtime.
@@ -164,6 +166,7 @@ impl App {
             Mode::List => self.handle_list_key(key),
             Mode::AddBar => self.handle_add_key(key),
             Mode::Help => self.handle_help_key(key),
+            Mode::ConfirmRemove { .. } => self.handle_confirm_key(key),
         }
     }
 
@@ -192,7 +195,16 @@ impl App {
             }
             KeyCode::Char('p') | KeyCode::Char(' ') => self.cmd_for_selected(Command::Pause),
             KeyCode::Char('r') => self.cmd_for_selected(Command::Resume),
-            KeyCode::Char('d') | KeyCode::Delete => self.cmd_for_selected(Command::Remove),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                // Removal is destructive, so confirm first.
+                match self.selected_id() {
+                    Some(id) => {
+                        self.mode = Mode::ConfirmRemove { id };
+                        Action::none()
+                    }
+                    None => Action::none(),
+                }
+            }
             KeyCode::Enter => self.toggle_pause_resume(),
             _ => Action::none(),
         }
@@ -265,6 +277,24 @@ impl App {
                 Action::none()
             }
             _ => Action::none(),
+        }
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::ConfirmRemove { id } = self.mode else {
+            return Action::none();
+        };
+        // Only an explicit "yes" confirms; everything else cancels (including
+        // unrecognized keys, per the default-cancel requirement).
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.mode = Mode::List;
+                Action::cmd(Command::Remove(id))
+            }
+            _ => {
+                self.mode = Mode::List;
+                Action::none()
+            }
         }
     }
 
