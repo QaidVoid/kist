@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, Mode};
+use crate::format::format_speed;
 use crate::model::AggregateStats;
 
 pub mod add_bar;
@@ -53,8 +54,8 @@ fn render_header(frame: &mut Frame, area: Rect, stats: &AggregateStats) {
         )),
         Span::raw(format!(
             "  \u{2193} {}  \u{2191} {}",
-            fmt_speed(stats.total_down),
-            fmt_speed(stats.total_up)
+            format_speed(stats.total_down),
+            format_speed(stats.total_up)
         )),
     ]);
     frame.render_widget(Paragraph::new(line).block(Block::bordered()), area);
@@ -105,28 +106,4 @@ pub(super) fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + area.height.saturating_sub(height) / 3;
     Rect::new(x, y, width, height)
-}
-
-/// Format a byte count with binary units, e.g. `1.4 GiB`.
-pub(super) fn fmt_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes == 0 {
-        return "0 B".to_string();
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[0])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// Format a bytes-per-second rate, e.g. `1.4 MiB/s`.
-pub(super) fn fmt_speed(bytes_per_sec: u64) -> String {
-    format!("{}/s", fmt_bytes(bytes_per_sec))
 }

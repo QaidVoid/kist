@@ -7,6 +7,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
 use crate::app::App;
+use crate::format::{format_size, format_speed};
 use crate::model::TorrentRow;
 
 /// Render the torrent list (or its empty state).
@@ -53,10 +54,10 @@ fn row_for(row: &TorrentRow) -> Row<'_> {
     let bar = progress_bar(row.progress_frac(), 10);
     Row::new(vec![
         Cell::from(row.name.clone()),
-        Cell::from(super::fmt_bytes(row.total_bytes)),
+        Cell::from(format_size(row.total_bytes)),
         Cell::from(format!("{bar} {:>5.1}%", row.progress_pct())),
-        Cell::from(super::fmt_speed(row.down_speed)),
-        Cell::from(super::fmt_speed(row.up_speed)),
+        Cell::from(format_speed(row.down_speed)),
+        Cell::from(format_speed(row.up_speed)),
         Cell::from(row.peers.to_string()),
         Cell::from(row.state.label()),
     ])

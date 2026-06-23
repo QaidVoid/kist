@@ -15,6 +15,7 @@ mod app;
 mod config;
 mod engine;
 mod error;
+mod format;
 mod model;
 mod ui;
 
