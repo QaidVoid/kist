@@ -12,10 +12,9 @@ use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, Mode};
 use crate::format::format_speed;
-use crate::model::AggregateStats;
-
 pub mod add_bar;
 pub mod confirm;
+pub mod filter_bar;
 pub mod help;
 pub mod list;
 
@@ -30,21 +29,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas::<4>(area);
 
-    render_header(frame, header, &app.snapshot.aggregate);
+    render_header(frame, header, app);
     list::render(frame, main, app);
     render_status(frame, status, app);
     render_footer(frame, footer, app);
 
     match app.mode {
         Mode::AddBar => add_bar::render(frame, area, app),
+        Mode::Filter => filter_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
         Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
         Mode::List => {}
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, stats: &AggregateStats) {
-    let line = Line::from(vec![
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let stats = &app.snapshot.aggregate;
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             "kist",
@@ -59,8 +60,20 @@ fn render_header(frame: &mut Frame, area: Rect, stats: &AggregateStats) {
             format_speed(stats.total_down),
             format_speed(stats.total_up)
         )),
-    ]);
-    frame.render_widget(Paragraph::new(line).block(Block::bordered()), area);
+        Span::raw(format!(
+            "  sort:{}{}",
+            app.sort_key.label(),
+            app.sort_dir.glyph()
+        )),
+    ];
+    if let Some(filter) = &app.filter {
+        spans.push(Span::raw("  filter:"));
+        spans.push(Span::styled(filter, Style::new().fg(Color::Yellow)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).block(Block::bordered()),
+        area,
+    );
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -73,7 +86,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(Span::styled(format!(" {message}"), style))
     } else {
-        match app.snapshot.rows.get(app.selected) {
+        match app.visible_rows().get(app.selected).copied() {
             Some(row) if row.state == RowState::Error => {
                 let msg = row
                     .error
@@ -95,9 +108,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints = match app.mode {
         Mode::AddBar => "enter: add  esc: cancel",
+        Mode::Filter => "enter: apply  esc: cancel  (blank clears)",
         Mode::Help => "esc / ?: close help",
         Mode::ConfirmRemove { .. } => "y: remove  n / esc: cancel",
-        Mode::List => "a:add  j/k:move  p:pause  r:resume  d:remove  ?:help  q:quit",
+        Mode::List => {
+            "a:add  j/k:move  p:pause  r:resume  d:remove  /:filter  s:sort  S:dir  ?:help  q:quit"
+        }
     };
     frame.render_widget(Line::raw(format!(" {hints}")), area);
 }

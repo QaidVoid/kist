@@ -10,10 +10,58 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::Command;
-use crate::model::{RowState, Snapshot};
+use crate::model::{RowState, Snapshot, TorrentRow};
 
 /// How long a transient status/error message stays on screen before clearing.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Column the torrent list is sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    State,
+    Progress,
+    Speed,
+}
+
+impl SortKey {
+    /// Lowercase label for display in the chrome.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::State => "state",
+            SortKey::Progress => "progress",
+            SortKey::Speed => "speed",
+        }
+    }
+
+    /// Next sort key in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            SortKey::Name => SortKey::State,
+            SortKey::State => SortKey::Progress,
+            SortKey::Progress => SortKey::Speed,
+            SortKey::Speed => SortKey::Name,
+        }
+    }
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    /// Arrow glyph for display in the chrome.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            SortDir::Asc => "\u{2191}",
+            SortDir::Desc => "\u{2193}",
+        }
+    }
+}
 
 /// The current top-level UI mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +74,8 @@ pub enum Mode {
     Help,
     /// A confirmation dialog is open for removing the torrent with this id.
     ConfirmRemove { id: usize },
+    /// The list filter entry prompt is open.
+    Filter,
 }
 
 /// A merged event fed to [`App::handle`] by the runtime.
@@ -76,6 +126,12 @@ pub struct App {
     pub wrap_width: usize,
     /// Latest snapshot received from the engine.
     pub snapshot: Snapshot,
+    /// Column the list is sorted by.
+    pub sort_key: SortKey,
+    /// Sort direction.
+    pub sort_dir: SortDir,
+    /// Active name filter (case-insensitive substring), if any.
+    pub filter: Option<String>,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -95,6 +151,9 @@ impl App {
             view_top: 0,
             wrap_width: 1,
             snapshot: Snapshot::default(),
+            sort_key: SortKey::Name,
+            sort_dir: SortDir::Asc,
+            filter: None,
             status: None,
             status_is_error: false,
             status_at: None,
@@ -104,12 +163,72 @@ impl App {
     /// Replace the snapshot, keeping the selection in range.
     pub fn update_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
-        let len = self.snapshot.rows.len();
+        self.clamp_selection();
+    }
+
+    /// The torrents currently shown: filtered by name and sorted by the active
+    /// key/direction. Computed view-side so sorting and filtering stay
+    /// synchronous and never touch the engine.
+    pub fn visible_rows(&self) -> Vec<&TorrentRow> {
+        let mut rows: Vec<&TorrentRow> = self.snapshot.rows.iter().collect();
+        if let Some(filter) = &self.filter {
+            let needle = filter.to_lowercase();
+            if !needle.is_empty() {
+                rows.retain(|r| r.name.to_lowercase().contains(&needle));
+            }
+        }
+        let dir = self.sort_dir;
+        rows.sort_by(|a, b| {
+            let primary = match self.sort_key {
+                SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortKey::State => a.state.cmp(&b.state),
+                SortKey::Progress => a.progress_frac().total_cmp(&b.progress_frac()),
+                SortKey::Speed => a.down_speed.cmp(&b.down_speed),
+            };
+            // Name is the stable tiebreaker so equal keys don't flicker.
+            let ordered = primary.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if dir == SortDir::Desc {
+                ordered.reverse()
+            } else {
+                ordered
+            }
+        });
+        rows
+    }
+
+    /// Keep `selected` within the bounds of the visible list.
+    fn clamp_selection(&mut self) {
+        let len = self.visible_rows().len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
             self.selected = len - 1;
         }
+    }
+
+    /// After a sort/filter change, try to keep the same torrent selected.
+    fn reselect(&mut self, prev_id: Option<usize>) {
+        if let Some(id) = prev_id
+            && let Some(i) = self.visible_rows().iter().position(|r| r.id == id)
+        {
+            self.selected = i;
+        } else {
+            self.clamp_selection();
+        }
+    }
+
+    /// Cycle the sort key (or toggle direction), keeping the selection stable.
+    fn cycle_sort(&mut self, toggle_dir: bool) {
+        let prev = self.selected_id();
+        if toggle_dir {
+            self.sort_dir = match self.sort_dir {
+                SortDir::Asc => SortDir::Desc,
+                SortDir::Desc => SortDir::Asc,
+            };
+        } else {
+            self.sort_key = self.sort_key.next();
+        }
+        self.reselect(prev);
     }
 
     /// Set the latest status message.
@@ -166,6 +285,7 @@ impl App {
             Mode::List => self.handle_list_key(key),
             Mode::AddBar => self.handle_add_key(key),
             Mode::Help => self.handle_help_key(key),
+            Mode::Filter => self.handle_filter_key(key),
             Mode::ConfirmRemove { .. } => self.handle_confirm_key(key),
         }
     }
@@ -185,8 +305,29 @@ impl App {
                 Action::none()
             }
             KeyCode::Char('a') => {
-                self.input.clear();
+                self.clear_input();
                 self.mode = Mode::AddBar;
+                Action::none()
+            }
+            KeyCode::Char('/') => {
+                if self.filter.is_some() {
+                    // Toggle the filter off.
+                    let prev = self.selected_id();
+                    self.filter = None;
+                    self.reselect(prev);
+                    Action::none()
+                } else {
+                    self.clear_input();
+                    self.mode = Mode::Filter;
+                    Action::none()
+                }
+            }
+            KeyCode::Char('s') => {
+                self.cycle_sort(false);
+                Action::none()
+            }
+            KeyCode::Char('S') => {
+                self.cycle_sort(true);
                 Action::none()
             }
             KeyCode::Char('?') => {
@@ -227,6 +368,36 @@ impl App {
                     Action::cmd(Command::Add(source))
                 }
             }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    fn handle_filter_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                self.mode = Mode::List;
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let prev = self.selected_id();
+                let text = self.input.trim().to_string();
+                self.clear_input();
+                self.mode = Mode::List;
+                self.filter = if text.is_empty() { None } else { Some(text) };
+                self.reselect(prev);
+                Action::none()
+            }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    /// Text-editing keys shared by the add and filter inputs.
+    ///
+    /// Returns `Some(action)` when the key was handled, else `None` so callers
+    /// can fall through.
+    fn handle_text_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let action = match key.code {
             KeyCode::Backspace => {
                 self.backspace();
                 Action::none()
@@ -266,8 +437,9 @@ impl App {
                 }
                 Action::none()
             }
-            _ => Action::none(),
-        }
+            _ => return None,
+        };
+        Some(action)
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) -> Action {
@@ -299,11 +471,12 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        if self.snapshot.rows.is_empty() {
+        let len = self.visible_rows().len();
+        if len == 0 {
             self.selected = 0;
             return;
         }
-        let max = self.snapshot.rows.len() - 1;
+        let max = len - 1;
         let next = self.selected as i32 + delta;
         self.selected = next.clamp(0, max as i32) as usize;
     }
@@ -412,7 +585,7 @@ impl App {
     }
 
     fn toggle_pause_resume(&self) -> Action {
-        match self.snapshot.rows.get(self.selected) {
+        match self.visible_rows().get(self.selected) {
             Some(row) if row.state == RowState::Paused => Action::cmd(Command::Resume(row.id)),
             Some(row) => Action::cmd(Command::Pause(row.id)),
             None => Action::none(),
@@ -420,7 +593,7 @@ impl App {
     }
 
     fn selected_id(&self) -> Option<usize> {
-        self.snapshot.rows.get(self.selected).map(|row| row.id)
+        self.visible_rows().get(self.selected).map(|row| row.id)
     }
 }
 
@@ -487,5 +660,62 @@ mod tests {
         a.insert_str("c\nd\r\ne");
         assert_eq!(a.input, "abcde");
         assert_eq!(a.cursor, 5);
+    }
+
+    fn row(id: usize, name: &str, state: RowState, frac: f64, speed: u64) -> TorrentRow {
+        TorrentRow {
+            id,
+            name: name.to_string(),
+            infohash: format!("h{id}"),
+            total_bytes: 100,
+            progress_bytes: (frac * 100.0) as u64,
+            finished: false,
+            down_speed: speed,
+            up_speed: 0,
+            peers: 0,
+            state,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn sort_by_name_then_speed_and_filter() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "charlie", RowState::Live, 0.5, 10),
+            row(1, "alpha", RowState::Live, 0.1, 30),
+            row(2, "bravo", RowState::Paused, 0.9, 20),
+        ]);
+
+        // Default: name ascending -> alpha, bravo, charlie.
+        let names: Vec<usize> = a.visible_rows().iter().map(|r| r.id).collect();
+        assert_eq!(names, vec![1, 2, 0]);
+
+        // Speed descending -> alpha(30), bravo(20), charlie(10).
+        a.sort_key = SortKey::Speed;
+        a.sort_dir = SortDir::Desc;
+        let by_speed: Vec<usize> = a.visible_rows().iter().map(|r| r.id).collect();
+        assert_eq!(by_speed, vec![1, 2, 0]);
+
+        // Case-insensitive filter "ra" matches only "bravo".
+        a.filter = Some("RA".to_string());
+        let filtered: Vec<usize> = a.visible_rows().iter().map(|r| r.id).collect();
+        assert_eq!(filtered, vec![2]);
+    }
+
+    #[test]
+    fn sort_keeps_selected_torrent() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "charlie", RowState::Live, 0.5, 10),
+            row(1, "alpha", RowState::Live, 0.1, 30),
+            row(2, "bravo", RowState::Paused, 0.9, 20),
+        ]);
+        a.selected = 0;
+        let before = a.visible_rows().get(a.selected).map(|r| r.id);
+        a.cycle_sort(false);
+        a.cycle_sort(true);
+        let after = a.visible_rows().get(a.selected).map(|r| r.id);
+        assert_eq!(before, after);
     }
 }

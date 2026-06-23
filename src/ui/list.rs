@@ -19,7 +19,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let rows: Vec<Row> = app.snapshot.rows.iter().map(row_for).collect();
+    let visible = app.visible_rows();
+    if visible.is_empty() {
+        let para = Paragraph::new(Line::raw(" No torrents match the filter."))
+            .block(Block::bordered().title("Torrents"));
+        frame.render_widget(para, area);
+        return;
+    }
+
+    let rows: Vec<Row> = visible.iter().map(|row| row_for(row)).collect();
     let header = Row::new(vec![
         Cell::from("Name"),
         Cell::from("Size"),
