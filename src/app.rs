@@ -67,6 +67,11 @@ pub struct App {
     pub input: String,
     /// Byte offset of the editing cursor within [`App::input`].
     pub cursor: usize,
+    /// Top visible visual line of the add bar (persisted for edge-scrolling).
+    pub view_top: usize,
+    /// Wrap width last used to render the add bar, so cursor movement matches
+    /// the displayed layout.
+    pub wrap_width: usize,
     /// Latest snapshot received from the engine.
     pub snapshot: Snapshot,
     /// Latest status/error message to display, if any.
@@ -85,6 +90,8 @@ impl App {
             selected: 0,
             input: String::new(),
             cursor: 0,
+            view_top: 0,
+            wrap_width: 1,
             snapshot: Snapshot::default(),
             status: None,
             status_is_error: false,
@@ -220,6 +227,14 @@ impl App {
                 self.move_right();
                 Action::none()
             }
+            KeyCode::Up => {
+                self.move_line(-1);
+                Action::none()
+            }
+            KeyCode::Down => {
+                self.move_line(1);
+                Action::none()
+            }
             KeyCode::Home => {
                 self.cursor = 0;
                 Action::none()
@@ -263,10 +278,11 @@ impl App {
         self.selected = next.clamp(0, max as i32) as usize;
     }
 
-    /// Clear the add bar and reset the cursor to the start.
+    /// Clear the add bar and reset the cursor and scroll to the start.
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.view_top = 0;
     }
 
     /// Insert a character at the cursor and advance past it.
@@ -276,9 +292,13 @@ impl App {
     }
 
     /// Insert a string at the cursor and advance past it.
+    ///
+    /// Newlines are stripped so the input stays a single logical line (the
+    /// prompt wraps it for display instead).
     fn insert_str(&mut self, s: &str) {
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        let filtered: String = s.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+        self.input.insert_str(self.cursor, &filtered);
+        self.cursor += filtered.len();
     }
 
     /// Delete the character immediately before the cursor.
@@ -308,6 +328,41 @@ impl App {
                 .unwrap_or(0);
             self.cursor += adv;
         }
+    }
+
+    /// Move the cursor across wrapped visual lines by `delta` (-1 up, +1 down),
+    /// preserving the column within the line and clamping to the text bounds.
+    fn move_line(&mut self, delta: i32) {
+        let width = self.wrap_width.max(1);
+        let total = self.input.chars().count();
+        let cur = self.cursor_char_index();
+        let line = (cur / width) as i32;
+        let col = cur % width;
+        let target_line = line + delta;
+        if target_line < 0 {
+            self.cursor = 0;
+            return;
+        }
+        let target = (target_line as usize) * width + col;
+        if target >= total {
+            self.cursor = self.input.len();
+        } else {
+            self.cursor = self.char_to_byte(target);
+        }
+    }
+
+    /// Char index of the cursor within the input.
+    fn cursor_char_index(&self) -> usize {
+        self.input[..self.cursor].chars().count()
+    }
+
+    /// Byte offset of the `idx`-th char, clamped to the input length.
+    fn char_to_byte(&self, idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(idx)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| self.input.len())
     }
 
     /// Byte index of the start of the character immediately before the cursor.
@@ -354,4 +409,53 @@ fn global_key(key: KeyEvent) -> Option<Action> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with(input: &str, cursor_char: usize, width: usize) -> App {
+        let mut a = App::new();
+        a.input = input.to_string();
+        a.cursor = a
+            .input
+            .char_indices()
+            .nth(cursor_char)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| a.input.len());
+        a.wrap_width = width;
+        a
+    }
+
+    #[test]
+    fn up_down_cross_wrapped_lines() {
+        // "abcdef" wrapped at 3 -> lines "abc" / "def". Cursor on 'e' (char 4).
+        let mut a = app_with("abcdef", 4, 3);
+        a.move_line(-1); // up -> line 0, col 1 -> 'b'
+        assert_eq!(a.cursor_char_index(), 1);
+        a.move_line(1); // down -> line 1, col 1 -> 'e'
+        assert_eq!(a.cursor_char_index(), 4);
+        a.move_line(1); // down past the last line -> end
+        assert_eq!(a.cursor, a.input.len());
+        a.move_line(-1); // up from end (line 2, col 0) -> line 1, col 0 -> 'd'
+        assert_eq!(a.cursor_char_index(), 3);
+    }
+
+    #[test]
+    fn up_at_top_goes_to_start() {
+        let mut a = app_with("abcdef", 1, 3);
+        a.move_line(-1);
+        assert_eq!(a.cursor, 0);
+    }
+
+    #[test]
+    fn insert_str_strips_newlines() {
+        let mut a = App::new();
+        a.input = "ab".to_string();
+        a.cursor = 2;
+        a.insert_str("c\nd\r\ne");
+        assert_eq!(a.input, "abcde");
+        assert_eq!(a.cursor, 5);
+    }
 }

@@ -19,7 +19,7 @@ pub mod help;
 pub mod list;
 
 /// Render the whole application.
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let [header, main, status, footer] = Layout::vertical([
         Constraint::Length(3),

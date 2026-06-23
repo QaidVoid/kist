@@ -71,7 +71,7 @@ fn run_ui(
 
     loop {
         app.expire_status();
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         // Block up to `refresh` for input; a timeout becomes a refresh Tick.
         let event = if event::poll(refresh)? {
