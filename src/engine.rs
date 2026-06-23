@@ -138,6 +138,7 @@ fn mbps_to_bytes(mbps: f64) -> u64 {
 }
 
 /// Commands the UI sends to the engine.
+#[derive(Debug)]
 pub enum Command {
     /// Add a torrent from the given source string.
     Add(String),
