@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by engine/UI in later task groups
-
 //! Plain, framework-agnostic view models shared between engine and UI.
 //!
 //! Nothing in this module depends on librqbit. The engine is responsible for
