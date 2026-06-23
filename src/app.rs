@@ -5,10 +5,15 @@
 //! via an [`Action`]. Rendering is pure given an `App`, so this module has no
 //! dependency on ratatui.
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::Command;
 use crate::model::{RowState, Snapshot};
+
+/// How long a transient status/error message stays on screen before clearing.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The current top-level UI mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +73,8 @@ pub struct App {
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
     pub status_is_error: bool,
+    /// When the current status was set, for auto-dismissal.
+    status_at: Option<Instant>,
 }
 
 impl App {
@@ -81,6 +88,7 @@ impl App {
             snapshot: Snapshot::default(),
             status: None,
             status_is_error: false,
+            status_at: None,
         }
     }
 
@@ -99,13 +107,37 @@ impl App {
     pub fn set_status(&mut self, message: String, is_error: bool) {
         self.status = Some(message);
         self.status_is_error = is_error;
+        self.status_at = Some(Instant::now());
+    }
+
+    /// Clear any transient status message.
+    pub fn clear_status(&mut self) {
+        self.status = None;
+        self.status_is_error = false;
+        self.status_at = None;
+    }
+
+    /// Clear the status if it has been visible longer than [`STATUS_TIMEOUT`].
+    pub fn expire_status(&mut self) {
+        if self
+            .status_at
+            .is_some_and(|at| at.elapsed() >= STATUS_TIMEOUT)
+        {
+            self.clear_status();
+        }
     }
 
     /// Handle a merged event, returning the action to take.
     pub fn handle(&mut self, event: Event) -> Action {
         match event {
             Event::Tick => Action::none(),
-            Event::Input(CrosstermEvent::Key(key)) => self.handle_key(key),
+            // Any key clears a transient status, then is processed normally.
+            Event::Input(CrosstermEvent::Key(key)) => {
+                if self.status.is_some() {
+                    self.clear_status();
+                }
+                self.handle_key(key)
+            }
             Event::Input(CrosstermEvent::Paste(text)) => {
                 // A bracketed paste: insert the whole string at the cursor.
                 if self.mode == Mode::AddBar {

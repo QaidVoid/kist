@@ -70,6 +70,7 @@ fn run_ui(
     app.update_snapshot(link.snapshots.borrow().clone());
 
     loop {
+        app.expire_status();
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         // Block up to `refresh` for input; a timeout becomes a refresh Tick.
