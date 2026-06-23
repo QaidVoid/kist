@@ -103,6 +103,13 @@ impl App {
         match event {
             Event::Tick => Action::none(),
             Event::Input(CrosstermEvent::Key(key)) => self.handle_key(key),
+            Event::Input(CrosstermEvent::Paste(text)) => {
+                // A bracketed paste: append the whole string to the add bar.
+                if self.mode == Mode::AddBar {
+                    self.input.push_str(&text);
+                }
+                Action::none()
+            }
             Event::Input(_) => Action::none(),
         }
     }
@@ -171,7 +178,12 @@ impl App {
                 Action::none()
             }
             KeyCode::Char(c) => {
-                if key.modifiers.is_empty() {
+                // Append printable characters, including uppercase (Shift+char).
+                // Skip only control/alt combinations; Ctrl+C quits globally.
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     self.input.push(c);
                 }
                 Action::none()

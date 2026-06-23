@@ -46,7 +46,7 @@ impl Engine {
         self.session
             .add_torrent(add, None)
             .await
-            .context("failed to add torrent")?;
+            .with_context(|| format!("failed to add torrent: {source}"))?;
         Ok(())
     }
 
@@ -188,10 +188,18 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                     if matches!(cmd, Command::Quit) {
                         break;
                     }
-                    if let Some(status) = handle_command(&engine, cmd).await {
-                        let _ = status_tx.send(status);
-                    }
-                    let _ = snapshot_tx.send(engine.snapshot());
+                    // Run each command in its own task so a slow operation
+                    // (e.g. resolving magnet metadata over the network) does
+                    // not block snapshots or other commands.
+                    let engine = engine.clone();
+                    let snapshot_tx = snapshot_tx.clone();
+                    let status_tx = status_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(status) = handle_command(&engine, cmd).await {
+                            let _ = status_tx.send(status);
+                        }
+                        let _ = snapshot_tx.send(engine.snapshot());
+                    });
                 }
                 _ = ticker.tick() => {
                     let _ = snapshot_tx.send(engine.snapshot());
@@ -237,5 +245,43 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             message: error::to_status_line(&e),
             is_error: true,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use librqbit::Magnet;
+
+    #[test]
+    fn supported_magnet_formats() {
+        // A realistic BTv1 magnet with & query params parses fine.
+        let v1 = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=ubuntu&tr=udp://example.org:1337";
+        assert!(Magnet::parse(v1).is_ok(), "BTv1 40-hex magnet should parse");
+
+        // Uppercase hex is accepted too.
+        let upper = "magnet:?xt=urn:btih:CAB507494D02EBB1178B38F2E9D7BE299C86B862";
+        assert!(
+            Magnet::parse(upper).is_ok(),
+            "uppercase BTv1 magnet should parse"
+        );
+
+        // A BTv2 multihash magnet (urn:btmh:1220...) also parses.
+        let v2 = "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e";
+        assert!(
+            Magnet::parse(v2).is_ok(),
+            "BTv2 multihash magnet should parse"
+        );
+
+        // A 64-hex value placed under urn:btih: (a BTv2 hash in a btih field) is rejected.
+        let bad =
+            "magnet:?xt=urn:btih:caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e";
+        let err = match Magnet::parse(bad) {
+            Ok(_) => panic!("expected the 64-hex-under-btih magnet to be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("length 40 or 32"),
+            "expected length error, got: {err}"
+        );
     }
 }

@@ -143,3 +143,64 @@ fn write_config(path: &Path, config: &Config) -> Result<()> {
 fn warn_fallback(path: &Path, reason: &str) {
     eprintln!("warning: {reason} (at {}); using defaults", path.display());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique temp file path for a test (caller cleans it up).
+    fn unique_tmp_path() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut path = std::env::temp_dir();
+        path.push(format!("kist-config-test-{}-{n}.toml", std::process::id()));
+        path
+    }
+
+    #[test]
+    fn missing_file_creates_default_and_uses_defaults() {
+        let path = unique_tmp_path();
+        let _ = std::fs::remove_file(&path);
+
+        let config = load_or_init(&path).expect("missing file should not error");
+        assert_eq!(
+            config.refresh_interval_ms,
+            Config::default().refresh_interval_ms
+        );
+        assert!(path.exists(), "default config file should be written");
+
+        // The written file must round-trip back to the same values.
+        let reloaded = load_or_init(&path).expect("reload should parse written file");
+        assert_eq!(reloaded.listen_ports, config.listen_ports);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalid_file_falls_back_gracefully() {
+        let path = unique_tmp_path();
+        std::fs::write(&path, "this is := not valid toml !!! [\n").unwrap();
+
+        let config = load_or_init(&path).expect("invalid file should not abort");
+        assert_eq!(config.enable_dht, Config::default().enable_dht);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn partial_file_fills_missing_fields_with_defaults() {
+        let path = unique_tmp_path();
+        std::fs::write(&path, "enable_dht = false\n").unwrap();
+
+        let config = load_or_init(&path).expect("partial file should parse");
+        assert!(!config.enable_dht, "explicit value must be honored");
+        assert_eq!(
+            config.refresh_interval_ms,
+            Config::default().refresh_interval_ms
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
