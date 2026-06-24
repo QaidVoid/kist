@@ -10,7 +10,7 @@ use crate::ui::centered_rect;
 
 /// Render the keybindings help popup.
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(54, 14, area);
+    let popup = centered_rect(56, 20, area);
     frame.render_widget(Clear, popup);
 
     let title = Line::from(vec![Span::styled(
@@ -18,19 +18,31 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )]);
 
+    let key = |k: &str| Span::styled(format!(" {:<8}", k), Style::new().fg(Color::Yellow));
+    let desc = |d: &str| Span::raw(d.to_string());
+
     let lines = vec![
         Line::raw(""),
-        Line::raw(" a        add a torrent"),
-        Line::raw(" j / k     move down / up"),
-        Line::raw(" p / space pause selected"),
-        Line::raw(" r        resume selected"),
-        Line::raw(" enter    toggle pause / resume"),
-        Line::raw(" d        remove (keep files)"),
-        Line::raw(" ?        toggle this help"),
-        Line::raw(" q        quit"),
-        Line::raw(" ctrl+c   quit"),
+        Line::from(vec![key("a"), desc("add a torrent")]),
+        Line::from(vec![key("j / k"), desc("move down / up")]),
+        Line::from(vec![key("i"), desc("open / close torrent details")]),
+        Line::from(vec![
+            key("tab"),
+            desc("cycle detail tab (overview/files/peers)"),
+        ]),
+        Line::from(vec![key("p / spc"), desc("pause selected")]),
+        Line::from(vec![key("r"), desc("resume selected")]),
+        Line::from(vec![key("enter"), desc("toggle pause / resume")]),
+        Line::from(vec![key("d"), desc("remove (asks to confirm)")]),
+        Line::from(vec![key("y / n"), desc("confirm / cancel removal")]),
+        Line::from(vec![key("/"), desc("filter by name (blank clears)")]),
+        Line::from(vec![key("s"), desc("cycle sort column")]),
+        Line::from(vec![key("S"), desc("reverse sort direction")]),
+        Line::from(vec![key("?"), desc("toggle this help")]),
+        Line::from(vec![key("q"), desc("quit")]),
+        Line::from(vec![key("ctrl+c"), desc("quit")]),
         Line::raw(""),
-        Line::raw(" esc cancels the current prompt or quits"),
+        Line::raw(" esc cancels prompts and closes details"),
     ];
 
     frame.render_widget(
