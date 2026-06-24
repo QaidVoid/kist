@@ -11,7 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, ManagedTorrent, Session, SessionOptions, TorrentStats, TorrentStatsState,
+    AddTorrent, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
+    TorrentStatsState,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -33,6 +34,15 @@ impl Engine {
         let opts = SessionOptions {
             disable_dht: !config.enable_dht,
             listen_port_range: Some(config.listen_port_range()),
+            // Persist the torrent list so it survives restarts, in a kist-owned
+            // folder (falling back to librqbit's default if the dir is unknown).
+            persistence: if config.enable_session_persistence {
+                Some(SessionPersistenceConfig::Json {
+                    folder: crate::config::persistence_directory().ok(),
+                })
+            } else {
+                None
+            },
             ..Default::default()
         };
         let session = Session::new_with_opts(config.download_directory.clone(), opts)

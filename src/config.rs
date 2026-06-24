@@ -24,6 +24,8 @@ pub struct Config {
     pub listen_ports: [u16; 2],
     /// Whether to enable the DHT (needed for magnet links).
     pub enable_dht: bool,
+    /// Whether to persist the torrent list across restarts.
+    pub enable_session_persistence: bool,
     /// UI refresh interval in milliseconds.
     pub refresh_interval_ms: u64,
 }
@@ -34,6 +36,7 @@ impl Default for Config {
             download_directory: default_download_dir(),
             listen_ports: [6881, 6889],
             enable_dht: true,
+            enable_session_persistence: true,
             refresh_interval_ms: 250,
         }
     }
@@ -95,9 +98,16 @@ fn default_download_dir() -> PathBuf {
 
 /// Resolve the default config file path under the OS config directory.
 pub fn default_config_path() -> Result<PathBuf> {
-    let dirs =
-        ProjectDirs::from("", "", APP_NAME).context("could not determine OS config directory")?;
-    Ok(dirs.config_dir().join("config.toml"))
+    Ok(project_dirs()?.config_dir().join("config.toml"))
+}
+
+/// The kist-owned folder for session persistence (under the OS data directory).
+pub fn persistence_directory() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_dir().join("session"))
+}
+
+fn project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("", "", APP_NAME).context("could not determine OS directories")
 }
 
 /// Load config from `path`, never aborting on a missing or invalid file.
