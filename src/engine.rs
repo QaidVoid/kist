@@ -10,12 +10,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
-use librqbit::{AddTorrent, ManagedTorrent, Session, SessionOptions, TorrentStatsState};
+use librqbit::{
+    AddTorrent, ManagedTorrent, Session, SessionOptions, TorrentStats, TorrentStatsState,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::error;
-use crate::model::{RowState, Snapshot, TorrentRow};
+use crate::model::{DetailFile, DetailSnapshot, RowState, Snapshot, TorrentRow};
 
 /// Owns the librqbit session and translates it into plain view models.
 pub struct Engine {
@@ -84,10 +86,63 @@ impl Engine {
         Snapshot::from_rows(rows)
     }
 
+    /// Build a detail snapshot for one torrent, or `None` if it is gone.
+    ///
+    /// Per-file progress is paired defensively with file metadata so a metadata
+    /// state change can never panic.
+    pub fn detail(&self, id: usize) -> Option<DetailSnapshot> {
+        let handle = self.session.get(TorrentIdOrHash::Id(id))?;
+        let stats = handle.stats();
+        let infohash = handle.shared().info_hash.as_string();
+        let name = handle.name().unwrap_or_else(|| infohash.clone());
+        let (down_speed, up_speed, peers) = live_speeds(&stats);
+        let file_progress = stats.file_progress.clone();
+
+        let files = handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fi)| DetailFile {
+                        name: fi.relative_filename.to_string_lossy().to_string(),
+                        size: fi.len,
+                        have: file_progress.get(i).copied().unwrap_or(0).min(fi.len),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(DetailSnapshot {
+            name,
+            infohash,
+            state: to_row_state(stats.state),
+            total_bytes: stats.total_bytes,
+            progress_bytes: stats.progress_bytes,
+            uploaded_bytes: stats.uploaded_bytes,
+            down_speed,
+            up_speed,
+            finished: stats.finished,
+            peers,
+            files,
+        })
+    }
+
     fn find_handle(&self, id: usize) -> Result<Arc<ManagedTorrent>> {
         self.session
             .get(TorrentIdOrHash::Id(id))
             .with_context(|| format!("torrent {id} not found"))
+    }
+}
+
+/// Extract download/upload speeds and the live peer count from torrent stats.
+fn live_speeds(stats: &TorrentStats) -> (u64, u64, usize) {
+    match &stats.live {
+        Some(live) => (
+            mbps_to_bytes(live.download_speed.mbps),
+            mbps_to_bytes(live.upload_speed.mbps),
+            live.snapshot.peer_stats.live,
+        ),
+        None => (0, 0, 0),
     }
 }
 
@@ -96,15 +151,7 @@ fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
     let stats = handle.stats();
     let infohash = handle.shared().info_hash.as_string();
     let name = handle.name().unwrap_or_else(|| infohash.clone());
-
-    let (down_speed, up_speed, peers) = match &stats.live {
-        Some(live) => (
-            mbps_to_bytes(live.download_speed.mbps),
-            mbps_to_bytes(live.upload_speed.mbps),
-            live.snapshot.peer_stats.live,
-        ),
-        None => (0, 0, 0),
-    };
+    let (down_speed, up_speed, peers) = live_speeds(&stats);
 
     TorrentRow {
         id,
@@ -146,6 +193,10 @@ pub enum Command {
     Resume(usize),
     /// Forget a torrent by id (files are kept).
     Remove(usize),
+    /// Begin publishing detail snapshots for the given torrent id.
+    FetchDetail(usize),
+    /// Stop publishing detail snapshots.
+    StopDetail,
     /// Shut the engine task down.
     Quit,
 }
@@ -164,6 +215,8 @@ pub struct EngineLink {
     pub commands: mpsc::Sender<Command>,
     /// Latest snapshot (always readable; coalesces rapid updates).
     pub snapshots: watch::Receiver<Snapshot>,
+    /// Latest per-torrent detail snapshot, or `None` when not in detail mode.
+    pub detail: watch::Receiver<Option<DetailSnapshot>>,
     /// Discrete status/error messages from the engine.
     pub status: mpsc::UnboundedReceiver<EngineStatus>,
 }
@@ -172,37 +225,72 @@ pub struct EngineLink {
 ///
 /// The task consumes [`Command`]s, applies them, and publishes a fresh
 /// [`Snapshot`] after each change as well as on a fixed `refresh` tick. Status
-/// messages (success or failure) are emitted on the status channel.
+/// messages (success or failure) are emitted on the status channel. While a
+/// [`Command::FetchDetail`] id is active, a [`DetailSnapshot`] is republished
+/// on each tick.
 pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     let (command_tx, mut command_rx) = mpsc::channel::<Command>(32);
     let (snapshot_tx, snapshot_rx) = watch::channel(engine.snapshot());
+    let (detail_tx, detail_rx) = watch::channel::<Option<DetailSnapshot>>(None);
     let (status_tx, status_rx) = mpsc::unbounded_channel::<EngineStatus>();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
+        // Torrent id currently shown in the detail pane, if any.
+        let mut detail_id: Option<usize> = None;
         loop {
             tokio::select! {
                 biased;
                 cmd = command_rx.recv() => {
                     let Some(cmd) = cmd else { break };
-                    if matches!(cmd, Command::Quit) {
-                        break;
-                    }
-                    // Run each command in its own task so a slow operation
-                    // (e.g. resolving magnet metadata over the network) does
-                    // not block snapshots or other commands.
-                    let engine = engine.clone();
-                    let snapshot_tx = snapshot_tx.clone();
-                    let status_tx = status_tx.clone();
-                    tokio::spawn(async move {
-                        if let Some(status) = handle_command(&engine, cmd).await {
-                            let _ = status_tx.send(status);
+                    match cmd {
+                        Command::Quit => break,
+                        // Cheap flag-setting commands are handled inline.
+                        Command::FetchDetail(id) => {
+                            detail_id = Some(id);
+                            match engine.detail(id) {
+                                Some(d) => { let _ = detail_tx.send(Some(d)); }
+                                None => {
+                                    detail_id = None;
+                                    let _ = detail_tx.send(None);
+                                    let _ = status_tx.send(EngineStatus {
+                                        message: format!("torrent {id} not found"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
                         }
-                        let _ = snapshot_tx.send(engine.snapshot());
-                    });
+                        Command::StopDetail => {
+                            detail_id = None;
+                            let _ = detail_tx.send(None);
+                        }
+                        // Action commands run in their own task so a slow
+                        // operation (e.g. resolving magnet metadata over the
+                        // network) does not block snapshots or other commands.
+                        other => {
+                            let engine = engine.clone();
+                            let snapshot_tx = snapshot_tx.clone();
+                            let status_tx = status_tx.clone();
+                            tokio::spawn(async move {
+                                if let Some(status) = handle_command(&engine, other).await {
+                                    let _ = status_tx.send(status);
+                                }
+                                let _ = snapshot_tx.send(engine.snapshot());
+                            });
+                        }
+                    }
                 }
                 _ = ticker.tick() => {
                     let _ = snapshot_tx.send(engine.snapshot());
+                    if let Some(id) = detail_id {
+                        match engine.detail(id) {
+                            Some(d) => { let _ = detail_tx.send(Some(d)); }
+                            None => {
+                                detail_id = None;
+                                let _ = detail_tx.send(None);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -211,11 +299,12 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     EngineLink {
         commands: command_tx,
         snapshots: snapshot_rx,
+        detail: detail_rx,
         status: status_rx,
     }
 }
 
-/// Apply a single command, returning a status message if one should be shown.
+/// Apply a single action command, returning a status message if one should be shown.
 async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
     let result: Result<String> = match cmd {
         Command::Add(source) => engine
@@ -234,7 +323,8 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             .remove(id)
             .await
             .map(|_| format!("removed torrent {id}")),
-        Command::Quit => return None,
+        // Detail and quit are handled by the spawn loop, not here.
+        Command::FetchDetail(_) | Command::StopDetail | Command::Quit => return None,
     };
     match result {
         Ok(message) => Some(EngineStatus {

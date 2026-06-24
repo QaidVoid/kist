@@ -100,3 +100,56 @@ impl Snapshot {
         Self { rows, aggregate }
     }
 }
+
+/// One file within a torrent's detail view.
+#[derive(Debug, Clone, Default)]
+pub struct DetailFile {
+    /// Path of the file relative to the download root.
+    pub name: String,
+    /// Total size in bytes.
+    pub size: u64,
+    /// Bytes confirmed downloaded.
+    pub have: u64,
+}
+
+impl DetailFile {
+    /// Downloaded fraction in `0.0..=1.0`.
+    pub fn frac(&self) -> f64 {
+        if self.size == 0 {
+            0.0
+        } else {
+            ((self.have as f64) / (self.size as f64)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// A detailed view of a single torrent, fetched on demand for the detail pane.
+///
+/// This is independent of the lightweight list [`Snapshot`] so reading detail
+/// data does not increase the cost of the regular list refresh.
+#[derive(Debug, Clone)]
+pub struct DetailSnapshot {
+    pub name: String,
+    pub infohash: String,
+    pub state: RowState,
+    pub total_bytes: u64,
+    pub progress_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub down_speed: u64,
+    pub up_speed: u64,
+    pub finished: bool,
+    /// Connected (live) peer count.
+    pub peers: usize,
+    pub files: Vec<DetailFile>,
+}
+
+impl DetailSnapshot {
+    /// Share ratio `uploaded / downloaded` as a fraction (may exceed 1.0).
+    pub fn ratio(&self) -> f64 {
+        if self.progress_bytes == 0 {
+            0.0
+        } else {
+            self.uploaded_bytes as f64 / self.progress_bytes as f64
+        }
+    }
+}

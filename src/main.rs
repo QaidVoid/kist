@@ -95,6 +95,12 @@ fn run_ui(
             let snapshot = link.snapshots.borrow_and_update();
             app.update_snapshot(snapshot.clone());
         }
+
+        // Apply the latest detail snapshot when in detail mode.
+        if link.detail.has_changed().unwrap_or(false) {
+            let detail = link.detail.borrow_and_update().clone();
+            app.set_detail(detail);
+        }
     }
 
     Ok(())

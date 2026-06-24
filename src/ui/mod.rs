@@ -14,6 +14,7 @@ use crate::app::{App, Mode};
 use crate::format::format_speed;
 pub mod add_bar;
 pub mod confirm;
+pub mod detail;
 pub mod filter_bar;
 pub mod help;
 pub mod list;
@@ -30,7 +31,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas::<4>(area);
 
     render_header(frame, header, app);
-    list::render(frame, main, app);
+    if let Mode::Detail { .. } = app.mode {
+        // Compressed list on top, detail pane below.
+        let [list_area, detail_area] =
+            Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas::<2>(main);
+        list::render(frame, list_area, app);
+        detail::render(frame, detail_area, app);
+    } else {
+        list::render(frame, main, app);
+    }
     render_status(frame, status, app);
     render_footer(frame, footer, app);
 
@@ -39,7 +48,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Filter => filter_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
         Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
-        Mode::List => {}
+        Mode::Detail { .. } | Mode::List => {}
     }
 }
 
@@ -111,8 +120,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Filter => "enter: apply  esc: cancel  (blank clears)",
         Mode::Help => "esc / ?: close help",
         Mode::ConfirmRemove { .. } => "y: remove  n / esc: cancel",
+        Mode::Detail { .. } => "tab:cycle  j/k:move  i/esc:close  q:quit",
         Mode::List => {
-            "a:add  j/k:move  p:pause  r:resume  d:remove  /:filter  s:sort  S:dir  ?:help  q:quit"
+            "a:add  j/k:move  i:details  p:pause  r:resume  d:remove  /:filter  s:sort  ?:help  q:quit"
         }
     };
     frame.render_widget(Line::raw(format!(" {hints}")), area);

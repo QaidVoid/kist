@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::Command;
-use crate::model::{RowState, Snapshot, TorrentRow};
+use crate::model::{DetailSnapshot, RowState, Snapshot, TorrentRow};
 
 /// How long a transient status/error message stays on screen before clearing.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +63,35 @@ impl SortDir {
     }
 }
 
+/// Active tab of the torrent detail pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailTab {
+    #[default]
+    Overview,
+    Files,
+    Peers,
+}
+
+impl DetailTab {
+    /// Next tab in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            DetailTab::Overview => DetailTab::Files,
+            DetailTab::Files => DetailTab::Peers,
+            DetailTab::Peers => DetailTab::Overview,
+        }
+    }
+
+    /// Lowercase label.
+    pub fn label(self) -> &'static str {
+        match self {
+            DetailTab::Overview => "overview",
+            DetailTab::Files => "files",
+            DetailTab::Peers => "peers",
+        }
+    }
+}
+
 /// The current top-level UI mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -76,6 +105,8 @@ pub enum Mode {
     ConfirmRemove { id: usize },
     /// The list filter entry prompt is open.
     Filter,
+    /// The detail pane is open for the torrent with this id.
+    Detail { id: usize },
 }
 
 /// A merged event fed to [`App::handle`] by the runtime.
@@ -132,6 +163,10 @@ pub struct App {
     pub sort_dir: SortDir,
     /// Active name filter (case-insensitive substring), if any.
     pub filter: Option<String>,
+    /// Latest detail snapshot for the pane, when in detail mode.
+    pub detail: Option<DetailSnapshot>,
+    /// Active tab of the detail pane.
+    pub detail_tab: DetailTab,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -154,6 +189,8 @@ impl App {
             sort_key: SortKey::Name,
             sort_dir: SortDir::Asc,
             filter: None,
+            detail: None,
+            detail_tab: DetailTab::default(),
             status: None,
             status_is_error: false,
             status_at: None,
@@ -231,6 +268,11 @@ impl App {
         self.reselect(prev);
     }
 
+    /// Replace the detail snapshot for the pane.
+    pub fn set_detail(&mut self, detail: Option<DetailSnapshot>) {
+        self.detail = detail;
+    }
+
     /// Set the latest status message.
     pub fn set_status(&mut self, message: String, is_error: bool) {
         self.status = Some(message);
@@ -287,6 +329,7 @@ impl App {
             Mode::Help => self.handle_help_key(key),
             Mode::Filter => self.handle_filter_key(key),
             Mode::ConfirmRemove { .. } => self.handle_confirm_key(key),
+            Mode::Detail { .. } => self.handle_detail_key(key),
         }
     }
 
@@ -330,6 +373,14 @@ impl App {
                 self.cycle_sort(true);
                 Action::none()
             }
+            KeyCode::Char('i') => match self.selected_id() {
+                Some(id) => {
+                    self.detail_tab = DetailTab::Overview;
+                    self.mode = Mode::Detail { id };
+                    Action::cmd(Command::FetchDetail(id))
+                }
+                None => Action::none(),
+            },
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 Action::none()
@@ -466,6 +517,47 @@ impl App {
             _ => {
                 self.mode = Mode::List;
                 Action::none()
+            }
+        }
+    }
+
+    fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Tab => {
+                self.detail_tab = self.detail_tab.next();
+                Action::none()
+            }
+            KeyCode::Char('i') | KeyCode::Esc => {
+                self.mode = Mode::List;
+                Action::cmd(Command::StopDetail)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                self.refocus_detail()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                self.refocus_detail()
+            }
+            KeyCode::Char('q') => Action {
+                quit: true,
+                ..Action::none()
+            },
+            _ => Action::none(),
+        }
+    }
+
+    /// After moving the selection in detail mode, retarget the pane at the new
+    /// torrent (or leave detail mode if nothing is selected).
+    fn refocus_detail(&mut self) -> Action {
+        match self.selected_id() {
+            Some(id) => {
+                self.mode = Mode::Detail { id };
+                Action::cmd(Command::FetchDetail(id))
+            }
+            None => {
+                self.mode = Mode::List;
+                Action::cmd(Command::StopDetail)
             }
         }
     }
