@@ -1,7 +1,7 @@
 //! Torrent detail pane, shown below a compressed list.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
@@ -11,16 +11,14 @@ use crate::format::{format_percent, format_ratio, format_size, format_speed};
 use crate::model::DetailSnapshot;
 
 /// Render the detail pane for the torrent currently in detail mode.
-pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+///
+/// The tab indicator stays pinned to the top while the tab body scrolls; the
+/// stored scroll offset is clamped to the content here so key handling can
+/// over-shoot freely.
+pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let Mode::Detail { id } = app.mode else {
         return;
     };
-
-    let mut lines = vec![tab_line(app.detail_tab), Line::raw("")];
-    match app.detail.as_ref() {
-        Some(d) => lines.extend(detail_lines(d, app.detail_tab)),
-        None => lines.push(Line::raw(" (no data yet)")),
-    }
 
     let title_name = app
         .detail
@@ -31,8 +29,27 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         format!(" Details: {title_name} "),
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     );
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
-    frame.render_widget(paragraph, area);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [tab_area, body_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas::<2>(inner);
+    frame.render_widget(Paragraph::new(tab_line(app.detail_tab)), tab_area);
+
+    let lines = match app.detail.as_ref() {
+        Some(d) => detail_lines(d, app.detail_tab),
+        None => vec![Line::raw(" (no data yet)")],
+    };
+
+    app.detail_page = body_area.height;
+    let max_scroll = (lines.len() as u16).saturating_sub(body_area.height);
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((app.detail_scroll, 0)),
+        body_area,
+    );
 }
 
 /// Build the tab indicator line, highlighting the active tab.

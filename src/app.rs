@@ -167,6 +167,11 @@ pub struct App {
     pub detail: Option<DetailSnapshot>,
     /// Active tab of the detail pane.
     pub detail_tab: DetailTab,
+    /// Vertical scroll offset, in lines, of the detail pane content.
+    pub detail_scroll: u16,
+    /// Height of the detail content viewport from the last render, used to size
+    /// page scrolling.
+    pub detail_page: u16,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -191,6 +196,8 @@ impl App {
             filter: None,
             detail: None,
             detail_tab: DetailTab::default(),
+            detail_scroll: 0,
+            detail_page: 0,
             status: None,
             status_is_error: false,
             status_at: None,
@@ -376,6 +383,7 @@ impl App {
             KeyCode::Char('i') => match self.selected_id() {
                 Some(id) => {
                     self.detail_tab = DetailTab::Overview;
+                    self.detail_scroll = 0;
                     self.mode = Mode::Detail { id };
                     Action::cmd(Command::FetchDetail(id))
                 }
@@ -525,6 +533,7 @@ impl App {
         match key.code {
             KeyCode::Tab => {
                 self.detail_tab = self.detail_tab.next();
+                self.detail_scroll = 0;
                 Action::none()
             }
             KeyCode::Char('i') | KeyCode::Esc => {
@@ -539,6 +548,30 @@ impl App {
                 self.move_selection(1);
                 self.refocus_detail()
             }
+            KeyCode::PageDown => {
+                self.detail_scroll = self.detail_scroll.saturating_add(self.detail_page.max(1));
+                Action::none()
+            }
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(self.detail_page.max(1));
+                Action::none()
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.detail_scroll = self.detail_scroll.saturating_add(self.detail_half_page());
+                Action::none()
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(self.detail_half_page());
+                Action::none()
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.detail_scroll = 0;
+                Action::none()
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.detail_scroll = u16::MAX;
+                Action::none()
+            }
             KeyCode::Char('q') => Action {
                 quit: true,
                 ..Action::none()
@@ -552,6 +585,7 @@ impl App {
     fn refocus_detail(&mut self) -> Action {
         match self.selected_id() {
             Some(id) => {
+                self.detail_scroll = 0;
                 self.mode = Mode::Detail { id };
                 Action::cmd(Command::FetchDetail(id))
             }
@@ -560,6 +594,11 @@ impl App {
                 Action::cmd(Command::StopDetail)
             }
         }
+    }
+
+    /// Half the detail viewport height, at least one line, for Ctrl+D/Ctrl+U.
+    fn detail_half_page(&self) -> u16 {
+        (self.detail_page / 2).max(1)
     }
 
     fn move_selection(&mut self, delta: i32) {

@@ -120,7 +120,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Filter => "enter: apply  esc: cancel  (blank clears)",
         Mode::Help => "esc / ?: close help",
         Mode::ConfirmRemove { .. } => "y: remove  n / esc: cancel",
-        Mode::Detail { .. } => "tab:cycle  j/k:move  i/esc:close  q:quit",
+        Mode::Detail { .. } => "tab:cycle  j/k:move  ^d/^u:scroll  i/esc:close  q:quit",
         Mode::List => {
             "a:add  j/k:move  i:details  p:pause  r:resume  d:remove  /:filter  s:sort  ?:help  q:quit"
         }

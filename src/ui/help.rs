@@ -10,7 +10,7 @@ use crate::ui::centered_rect;
 
 /// Render the keybindings help popup.
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(56, 20, area);
+    let popup = centered_rect(56, 22, area);
     frame.render_widget(Clear, popup);
 
     let title = Line::from(vec![Span::styled(
@@ -30,6 +30,11 @@ pub fn render(frame: &mut Frame, area: Rect) {
             key("tab"),
             desc("cycle detail tab (overview/files/peers)"),
         ]),
+        Line::from(vec![
+            key("^d/^u"),
+            desc("scroll detail content (also pgdn/pgup)"),
+        ]),
+        Line::from(vec![key("g / G"), desc("detail top / bottom (also home/end)")]),
         Line::from(vec![key("p / spc"), desc("pause selected")]),
         Line::from(vec![key("r"), desc("resume selected")]),
         Line::from(vec![key("enter"), desc("toggle pause / resume")]),
