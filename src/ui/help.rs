@@ -2,23 +2,18 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 
-use crate::ui::centered_rect;
+use crate::ui::{centered_rect, theme};
 
 /// Render the keybindings help popup.
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(56, 22, area);
+    let popup = centered_rect(56, 23, area);
     frame.render_widget(Clear, popup);
 
-    let title = Line::from(vec![Span::styled(
-        " kist keybindings ",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )]);
-
-    let key = |k: &str| Span::styled(format!(" {:<8}", k), Style::new().fg(Color::Yellow));
+    let key = |k: &str| Span::styled(format!(" {:<8}", k), theme::key_style());
     let desc = |d: &str| Span::raw(d.to_string());
 
     let lines = vec![
@@ -28,7 +23,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(vec![key("i"), desc("open / close torrent details")]),
         Line::from(vec![
             key("tab"),
-            desc("cycle detail tab (overview/files/peers)"),
+            desc("cycle detail tab (overview/files/peers/trackers)"),
         ]),
         Line::from(vec![
             key("^d/^u"),
@@ -47,11 +42,18 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(vec![key("q"), desc("quit")]),
         Line::from(vec![key("ctrl+c"), desc("quit")]),
         Line::raw(""),
-        Line::raw(" esc cancels prompts and closes details"),
+        Line::from(vec![Span::styled(
+            " esc cancels prompts and closes details",
+            Style::new().fg(theme::DIM),
+        )]),
+        Line::from(vec![Span::styled(
+            " narrow terminals hide low-priority columns",
+            Style::new().fg(theme::DIM),
+        )]),
     ];
 
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title)),
+        Paragraph::new(lines).block(theme::block().title(theme::title(" kist keybindings ".to_string()))),
         popup,
     );
 }

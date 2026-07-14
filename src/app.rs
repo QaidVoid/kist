@@ -5,15 +5,19 @@
 //! via an [`Action`]. Rendering is pure given an `App`, so this module has no
 //! dependency on ratatui.
 
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::Command;
-use crate::model::{DetailSnapshot, RowState, Snapshot, TorrentRow};
+use crate::model::{DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
 
 /// How long a transient status/error message stays on screen before clearing.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Number of recent speed samples kept for the detail sparklines.
+const SPEED_HISTORY_LEN: usize = 60;
 
 /// Column the torrent list is sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,7 @@ pub enum DetailTab {
     Overview,
     Files,
     Peers,
+    Trackers,
 }
 
 impl DetailTab {
@@ -78,7 +83,8 @@ impl DetailTab {
         match self {
             DetailTab::Overview => DetailTab::Files,
             DetailTab::Files => DetailTab::Peers,
-            DetailTab::Peers => DetailTab::Overview,
+            DetailTab::Peers => DetailTab::Trackers,
+            DetailTab::Trackers => DetailTab::Overview,
         }
     }
 
@@ -88,6 +94,7 @@ impl DetailTab {
             DetailTab::Overview => "overview",
             DetailTab::Files => "files",
             DetailTab::Peers => "peers",
+            DetailTab::Trackers => "trackers",
         }
     }
 }
@@ -172,6 +179,16 @@ pub struct App {
     /// Height of the detail content viewport from the last render, used to size
     /// page scrolling.
     pub detail_page: u16,
+    /// Recent download-speed samples for the detail torrent (oldest first).
+    pub detail_down_history: VecDeque<u64>,
+    /// Recent upload-speed samples for the detail torrent (oldest first).
+    pub detail_up_history: VecDeque<u64>,
+    /// Torrent id the history and peer-speed buffers belong to.
+    history_id: Option<usize>,
+    /// Smoothed per-peer download speeds (bytes/s), keyed by peer address.
+    pub peer_speeds: HashMap<String, u64>,
+    /// Last-seen fetched counter and timestamp per peer, for speed derivation.
+    peer_samples: HashMap<String, (u64, Instant)>,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -198,6 +215,11 @@ impl App {
             detail_tab: DetailTab::default(),
             detail_scroll: 0,
             detail_page: 0,
+            detail_down_history: VecDeque::new(),
+            detail_up_history: VecDeque::new(),
+            history_id: None,
+            peer_speeds: HashMap::new(),
+            peer_samples: HashMap::new(),
             status: None,
             status_is_error: false,
             status_at: None,
@@ -275,9 +297,51 @@ impl App {
         self.reselect(prev);
     }
 
-    /// Replace the detail snapshot for the pane.
+    /// Replace the detail snapshot for the pane, feeding the speed history and
+    /// per-peer speed buffers (which reset when the target torrent changes).
     pub fn set_detail(&mut self, detail: Option<DetailSnapshot>) {
+        let id = match self.mode {
+            Mode::Detail { id } => Some(id),
+            _ => None,
+        };
+        if id != self.history_id {
+            self.detail_down_history.clear();
+            self.detail_up_history.clear();
+            self.peer_speeds.clear();
+            self.peer_samples.clear();
+            self.history_id = id;
+        }
+        if let Some(d) = &detail
+            && id.is_some()
+        {
+            push_capped(&mut self.detail_down_history, d.down_speed);
+            push_capped(&mut self.detail_up_history, d.up_speed);
+            self.update_peer_speeds(&d.peer_rows);
+        }
         self.detail = detail;
+    }
+
+    /// Derive per-peer download speeds from fetched-bytes deltas, lightly
+    /// smoothed with an EMA. Peers seen for the first time get no speed yet.
+    fn update_peer_speeds(&mut self, peers: &[PeerRow]) {
+        let now = Instant::now();
+        let mut samples = HashMap::with_capacity(peers.len());
+        for p in peers {
+            if let Some((last_bytes, last_at)) = self.peer_samples.get(&p.addr) {
+                let dt = now.duration_since(*last_at).as_secs_f64();
+                if dt > 0.0 {
+                    let inst = (p.fetched_bytes.saturating_sub(*last_bytes) as f64 / dt) as u64;
+                    let smoothed = match self.peer_speeds.get(&p.addr) {
+                        Some(prev) => (*prev as f64 * 0.6 + inst as f64 * 0.4) as u64,
+                        None => inst,
+                    };
+                    self.peer_speeds.insert(p.addr.clone(), smoothed);
+                }
+            }
+            samples.insert(p.addr.clone(), (p.fetched_bytes, now));
+        }
+        self.peer_speeds.retain(|addr, _| samples.contains_key(addr));
+        self.peer_samples = samples;
     }
 
     /// Set the latest status message.
@@ -734,6 +798,14 @@ impl Default for App {
     }
 }
 
+/// Push a sample, dropping the oldest once the history is full.
+fn push_capped(buf: &mut VecDeque<u64>, value: u64) {
+    if buf.len() == SPEED_HISTORY_LEN {
+        buf.pop_front();
+    }
+    buf.push_back(value);
+}
+
 /// Ctrl+C quits from any mode.
 fn global_key(key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -800,9 +872,11 @@ mod tests {
             infohash: format!("h{id}"),
             total_bytes: 100,
             progress_bytes: (frac * 100.0) as u64,
+            uploaded_bytes: 0,
             finished: false,
             down_speed: speed,
             up_speed: 0,
+            eta: None,
             peers: 0,
             state,
             error: None,

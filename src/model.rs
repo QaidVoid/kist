@@ -4,6 +4,8 @@
 //! translating librqbit types into the values defined here, so the UI stays
 //! free of engine concerns and easy to reason about.
 
+use std::time::Duration;
+
 /// Coarse torrent state mirroring librqbit's `TorrentStatsState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowState {
@@ -33,15 +35,27 @@ pub struct TorrentRow {
     pub infohash: String,
     pub total_bytes: u64,
     pub progress_bytes: u64,
+    pub uploaded_bytes: u64,
     pub finished: bool,
     pub down_speed: u64,
     pub up_speed: u64,
+    /// Estimated time remaining, when the engine can compute one.
+    pub eta: Option<Duration>,
     pub peers: usize,
     pub state: RowState,
     pub error: Option<String>,
 }
 
 impl TorrentRow {
+    /// Share ratio `uploaded / downloaded` (may exceed 1.0).
+    pub fn ratio(&self) -> f64 {
+        if self.progress_bytes == 0 {
+            0.0
+        } else {
+            self.uploaded_bytes as f64 / self.progress_bytes as f64
+        }
+    }
+
     /// Progress as a fraction in `0.0..=1.0`.
     pub fn progress_frac(&self) -> f64 {
         if self.total_bytes == 0 {
@@ -123,6 +137,17 @@ impl DetailFile {
     }
 }
 
+/// One connected peer in a torrent's detail view.
+#[derive(Debug, Clone)]
+pub struct PeerRow {
+    /// Peer socket address as a string.
+    pub addr: String,
+    /// librqbit peer state name (e.g. `live`).
+    pub state: String,
+    /// Total payload bytes fetched from this peer.
+    pub fetched_bytes: u64,
+}
+
 /// A detailed view of a single torrent, fetched on demand for the detail pane.
 ///
 /// This is independent of the lightweight list [`Snapshot`] so reading detail
@@ -137,10 +162,18 @@ pub struct DetailSnapshot {
     pub uploaded_bytes: u64,
     pub down_speed: u64,
     pub up_speed: u64,
+    /// Estimated time remaining, when the engine can compute one.
+    pub eta: Option<Duration>,
     pub finished: bool,
     /// Connected (live) peer count.
     pub peers: usize,
     pub files: Vec<DetailFile>,
+    /// Connected peers, sorted by address.
+    pub peer_rows: Vec<PeerRow>,
+    /// Tracker announce URLs, sorted.
+    pub trackers: Vec<String>,
+    /// Per-piece have flags, when available.
+    pub pieces: Option<Vec<bool>>,
 }
 
 impl DetailSnapshot {

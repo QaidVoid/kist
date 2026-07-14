@@ -11,18 +11,20 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
-    TorrentStatsState,
+    AddTorrent, Api, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+    TorrentStats, TorrentStatsState,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::error;
-use crate::model::{DetailFile, DetailSnapshot, RowState, Snapshot, TorrentRow};
+use crate::model::{DetailFile, DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
 
 /// Owns the librqbit session and translates it into plain view models.
 pub struct Engine {
     session: Arc<Session>,
+    /// librqbit API wrapper; the only public route to some data (piece haves).
+    api: Api,
 }
 
 impl Engine {
@@ -48,7 +50,8 @@ impl Engine {
         let session = Session::new_with_opts(config.download_directory.clone(), opts)
             .await
             .context("failed to initialize torrent session")?;
-        Ok(Self { session })
+        let api = Api::new(session.clone(), None);
+        Ok(Self { session, api })
     }
 
     /// Add a torrent from a magnet link, `.torrent` file path, or URL.
@@ -108,6 +111,41 @@ impl Engine {
         let (down_speed, up_speed, peers) = live_speeds(&stats);
         let file_progress = stats.file_progress.clone();
 
+        let live = handle.live();
+        let eta = live
+            .as_ref()
+            .and_then(|l| l.down_speed_estimator().time_remaining());
+        let peer_rows = live
+            .map(|l| {
+                let snapshot = l.per_peer_stats_snapshot(Default::default());
+                let mut rows: Vec<PeerRow> = snapshot
+                    .peers
+                    .into_iter()
+                    .map(|(addr, p)| PeerRow {
+                        addr,
+                        state: p.state.to_string(),
+                        fetched_bytes: p.counters.fetched_bytes,
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.addr.cmp(&b.addr));
+                rows
+            })
+            .unwrap_or_default();
+
+        let mut trackers: Vec<String> = handle
+            .shared()
+            .trackers
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        trackers.sort();
+
+        let pieces = self
+            .api
+            .api_dump_haves(TorrentIdOrHash::Id(id))
+            .ok()
+            .and_then(|dump| parse_haves(&dump));
+
         let files = handle
             .with_metadata(|m| {
                 m.file_infos
@@ -131,9 +169,13 @@ impl Engine {
             uploaded_bytes: stats.uploaded_bytes,
             down_speed,
             up_speed,
+            eta,
             finished: stats.finished,
             peers,
             files,
+            peer_rows,
+            trackers,
+            pieces,
         })
     }
 
@@ -162,6 +204,9 @@ fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
     let infohash = handle.shared().info_hash.as_string();
     let name = handle.name().unwrap_or_else(|| infohash.clone());
     let (down_speed, up_speed, peers) = live_speeds(&stats);
+    let eta = handle
+        .live()
+        .and_then(|l| l.down_speed_estimator().time_remaining());
 
     TorrentRow {
         id,
@@ -169,13 +214,35 @@ fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
         infohash,
         total_bytes: stats.total_bytes,
         progress_bytes: stats.progress_bytes,
+        uploaded_bytes: stats.uploaded_bytes,
         finished: stats.finished,
         down_speed,
         up_speed,
+        eta,
         peers,
         state: to_row_state(stats.state),
         error: stats.error,
     }
+}
+
+/// Parse librqbit's have-pieces debug dump into per-piece flags.
+///
+/// The dump ends in a `[1, 0, 1, ...]` list; anything unexpected yields `None`
+/// so the UI simply omits the piece map.
+fn parse_haves(dump: &str) -> Option<Vec<bool>> {
+    let (_, list) = dump.rsplit_once('[')?;
+    let list = list.trim_end().strip_suffix(']')?;
+    let bits: Vec<bool> = list
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if bits.is_empty() { None } else { Some(bits) }
 }
 
 fn to_row_state(state: TorrentStatsState) -> RowState {
@@ -351,6 +418,18 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
 #[cfg(test)]
 mod tests {
     use librqbit::Magnet;
+
+    #[test]
+    fn parse_haves_extracts_bit_list() {
+        let dump = "BitSlice<u8, Msb0> { addr: 0x7f01, head: 000, bits: 5 } [1, 0, 1, 1, 0]";
+        assert_eq!(
+            super::parse_haves(dump),
+            Some(vec![true, false, true, true, false])
+        );
+        assert_eq!(super::parse_haves("[]"), None);
+        assert_eq!(super::parse_haves("no list here"), None);
+        assert_eq!(super::parse_haves("[1, 2]"), None);
+    }
 
     #[test]
     fn supported_magnet_formats() {

@@ -1,88 +1,109 @@
 //! Remove-confirmation modal overlay.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{App, Mode};
-use crate::ui::centered_rect;
+use crate::format::{display_width, format_size, truncate_end};
+use crate::ui::theme;
 
-/// Render a centered confirmation dialog naming the torrent being removed.
+/// Widest the dialog content may grow before the name is truncated.
+const MAX_CONTENT_WIDTH: usize = 70;
+/// Narrowest dialog that still fits the action buttons comfortably.
+const MIN_CONTENT_WIDTH: usize = 40;
+
+/// Render a centered confirmation dialog describing the torrent being removed.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let Mode::ConfirmRemove { id } = app.mode else {
         return;
     };
-    let name = app
-        .snapshot
-        .rows
-        .iter()
-        .find(|row| row.id == id)
-        .map(|row| row.name.clone())
+    let row = app.snapshot.rows.iter().find(|row| row.id == id);
+    let name = row
+        .map(|r| r.name.clone())
         .unwrap_or_else(|| format!("torrent {id}"));
 
-    let popup = centered_rect(64, 6, area);
+    // Fit the dialog to its content, clamped to the frame.
+    let max_content = (area.width.saturating_sub(6) as usize).min(MAX_CONTENT_WIDTH);
+    let name_display = truncate_end(&name, max_content.saturating_sub(5));
+    let content_width = display_width(&name_display)
+        .saturating_add(5)
+        .clamp(MIN_CONTENT_WIDTH.min(max_content), max_content);
+
+    let popup = centered_fixed(content_width as u16 + 2, 11, area);
     frame.render_widget(Clear, popup);
 
-    let block = Block::bordered()
+    let block = theme::block()
         .title(Span::styled(
             " Confirm removal ",
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::WARN).add_modifier(Modifier::BOLD),
         ))
-        .style(Style::new().fg(Color::Yellow));
-    let inner = block.inner(popup);
+        .border_style(Style::new().fg(theme::WARN));
 
-    // Truncate the name so the question line fits the dialog.
-    let prefix = "Remove ";
-    let suffix = "?";
-    let budget = inner.width as usize;
-    let fixed = prefix.chars().count() + suffix.chars().count();
-    let max_name = budget.saturating_sub(fixed).max(1);
-    let display_name = truncate(&name, max_name);
+    let glyph_span = match row {
+        Some(r) => Span::styled(
+            format!("  {} ", theme::state_glyph(r.state, r.finished)),
+            theme::state_style(r.state, r.finished),
+        ),
+        None => Span::raw("  "),
+    };
+    let stats = match row {
+        Some(r) => format!(
+            "     {} \u{b7} {:.1}% downloaded",
+            format_size(r.total_bytes),
+            r.progress_pct()
+        ),
+        None => "     (no longer in the list)".to_string(),
+    };
 
     let lines = vec![
         Line::raw(""),
+        Line::from(Span::styled(
+            " Remove this torrent?",
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
         Line::from(vec![
-            Span::raw(prefix.to_string()),
+            glyph_span,
             Span::styled(
-                display_name,
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                name_display,
+                Style::new().fg(theme::ERROR).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(suffix.to_string()),
         ]),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled(stats, Style::new().fg(theme::DIM))),
+        Line::raw(""),
+        Line::from(Span::styled(
             " Files are kept on disk.",
-            Style::new().fg(Color::DarkGray),
-        )]),
+            Style::new().fg(theme::DIM),
+        )),
         Line::raw(""),
         Line::from(vec![
             Span::styled(
-                " y",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                " y Remove ",
+                Style::new()
+                    .bg(theme::ERROR)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" confirm    "),
+            Span::raw("   "),
             Span::styled(
-                "n",
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                " n / esc Cancel ",
+                Style::new().bg(Color::DarkGray).fg(Color::White),
             ),
-            Span::raw(" / "),
-            Span::styled(
-                "esc",
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" cancel"),
-        ]),
+        ])
+        .alignment(Alignment::Center),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-/// Truncate `s` to `max` display characters, appending an ellipsis if cut.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}\u{2026}")
+/// Center a fixed-size popup within `area`, clamped to the frame.
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width).max(1);
+    let height = height.min(area.height).max(1);
+    let x = area.x + (area.width - width) / 2;
+    let y = area.y + (area.height - height) / 3;
+    Rect::new(x, y, width, height)
 }

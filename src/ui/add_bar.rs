@@ -2,11 +2,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::style::Style;
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::App;
-use crate::ui::centered_rect;
+use crate::ui::{centered_rect, theme};
 
 /// Render the add-torrent prompt as a fixed-height centered textbox.
 ///
@@ -19,7 +19,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(70, 5, area);
     frame.render_widget(Clear, popup);
 
-    let block = Block::bordered().title(" Add torrent (magnet / .torrent path / URL) ");
+    let block = theme::block().title(theme::title(
+        " Add torrent (magnet / .torrent path / URL) ".to_string(),
+    ));
     let inner = block.inner(popup);
     let width = (inner.width as usize).max(1);
     let visible_rows = (inner.height as usize).max(1);
@@ -59,7 +61,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .join("\n");
 
     let paragraph = Paragraph::new(visible)
-        .style(Style::new().fg(Color::Cyan))
+        .style(Style::new().fg(theme::ACCENT))
         .block(block);
     frame.render_widget(paragraph, popup);
 
