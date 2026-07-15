@@ -1,7 +1,13 @@
 [package]
 name = "kist"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
+description = "A simple terminal torrent client built on librqbit"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/QaidVoid/kist"
+readme = "README.md"
+keywords = ["torrent", "bittorrent", "tui", "terminal"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.102"
