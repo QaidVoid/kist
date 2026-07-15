@@ -1,6 +1,6 @@
 [package]
 name = "kist"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "A simple terminal torrent client built on librqbit"
 license = "MIT OR Apache-2.0"
