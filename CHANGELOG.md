@@ -1,5 +1,5 @@
 
-## [0.0.1](https://github.com/QaidVoid/kist/compare/v0.0.0...v0.0.1) - 2026-07-15
+## [0.1.0](https://github.com/QaidVoid/kist/compare/v0.0.0...v0.1.0) - 2026-07-15
 
 ### ⛰️  Features
 
