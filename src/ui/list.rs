@@ -41,13 +41,55 @@ struct Col {
 /// Display order. Drop order (narrowing) is ascending priority:
 /// Ratio, Peers, ETA, Up, Size, Down, Progress.
 const COLS: [Col; 7] = [
-    Col { id: ColId::Size, header: "Size", width: 9, align: Alignment::Right, priority: 4 },
-    Col { id: ColId::Progress, header: "Progress", width: 24, align: Alignment::Left, priority: 6 },
-    Col { id: ColId::Eta, header: "ETA", width: 7, align: Alignment::Right, priority: 2 },
-    Col { id: ColId::Down, header: "Down", width: 11, align: Alignment::Right, priority: 5 },
-    Col { id: ColId::Up, header: "Up", width: 11, align: Alignment::Right, priority: 3 },
-    Col { id: ColId::Peers, header: "Peers", width: 5, align: Alignment::Right, priority: 1 },
-    Col { id: ColId::Ratio, header: "Ratio", width: 5, align: Alignment::Right, priority: 0 },
+    Col {
+        id: ColId::Size,
+        header: "Size",
+        width: 9,
+        align: Alignment::Right,
+        priority: 4,
+    },
+    Col {
+        id: ColId::Progress,
+        header: "Progress",
+        width: 24,
+        align: Alignment::Left,
+        priority: 6,
+    },
+    Col {
+        id: ColId::Eta,
+        header: "ETA",
+        width: 7,
+        align: Alignment::Right,
+        priority: 2,
+    },
+    Col {
+        id: ColId::Down,
+        header: "Down",
+        width: 11,
+        align: Alignment::Right,
+        priority: 5,
+    },
+    Col {
+        id: ColId::Up,
+        header: "Up",
+        width: 11,
+        align: Alignment::Right,
+        priority: 3,
+    },
+    Col {
+        id: ColId::Peers,
+        header: "Peers",
+        width: 5,
+        align: Alignment::Right,
+        priority: 1,
+    },
+    Col {
+        id: ColId::Ratio,
+        header: "Ratio",
+        width: 5,
+        align: Alignment::Right,
+        priority: 0,
+    },
 ];
 
 /// Pick the columns that fit `width`, dropping the lowest priority first.
@@ -87,7 +129,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let lines = vec![
             Line::raw(""),
             Line::from(vec![
-                Span::styled(" No torrents match the filter. Press ", theme::header_style()),
+                Span::styled(
+                    " No torrents match the filter. Press ",
+                    theme::header_style(),
+                ),
                 Span::styled("/", theme::key_style()),
                 Span::styled(" to clear it.", theme::header_style()),
             ]),

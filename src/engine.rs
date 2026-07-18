@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use crate::config::Config;
 use crate::error;
 use crate::model::{DetailFile, DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
+use crate::search::{self, SearchOutcome};
 
 /// Owns the librqbit session and translates it into plain view models.
 pub struct Engine {
@@ -274,6 +275,8 @@ pub enum Command {
     FetchDetail(usize),
     /// Stop publishing detail snapshots.
     StopDetail,
+    /// Search public indexers with the given query.
+    Search(String),
     /// Shut the engine task down.
     Quit,
 }
@@ -296,6 +299,8 @@ pub struct EngineLink {
     pub detail: watch::Receiver<Option<DetailSnapshot>>,
     /// Discrete status/error messages from the engine.
     pub status: mpsc::UnboundedReceiver<EngineStatus>,
+    /// Search outcomes, one per [`Command::Search`].
+    pub search: mpsc::UnboundedReceiver<SearchOutcome>,
 }
 
 /// Spawn the engine task.
@@ -310,6 +315,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     let (snapshot_tx, snapshot_rx) = watch::channel(engine.snapshot());
     let (detail_tx, detail_rx) = watch::channel::<Option<DetailSnapshot>>(None);
     let (status_tx, status_rx) = mpsc::unbounded_channel::<EngineStatus>();
+    let (search_tx, search_rx) = mpsc::unbounded_channel::<SearchOutcome>();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
@@ -340,6 +346,14 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                         Command::StopDetail => {
                             detail_id = None;
                             let _ = detail_tx.send(None);
+                        }
+                        // Search runs against public indexers, not the session,
+                        // so it gets its own task and result channel.
+                        Command::Search(query) => {
+                            let search_tx = search_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = search_tx.send(search::search(query).await);
+                            });
                         }
                         // Action commands run in their own task so a slow
                         // operation (e.g. resolving magnet metadata over the
@@ -378,6 +392,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
         snapshots: snapshot_rx,
         detail: detail_rx,
         status: status_rx,
+        search: search_rx,
     }
 }
 
@@ -400,8 +415,10 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             .remove(id)
             .await
             .map(|_| format!("removed torrent {id}")),
-        // Detail and quit are handled by the spawn loop, not here.
-        Command::FetchDetail(_) | Command::StopDetail | Command::Quit => return None,
+        // Detail, search, and quit are handled by the spawn loop, not here.
+        Command::FetchDetail(_) | Command::StopDetail | Command::Search(_) | Command::Quit => {
+            return None;
+        }
     };
     match result {
         Ok(message) => Some(EngineStatus {

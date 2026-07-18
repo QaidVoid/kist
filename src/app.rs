@@ -12,6 +12,7 @@ use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers}
 
 use crate::engine::Command;
 use crate::model::{DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
+use crate::search::{SearchOutcome, SearchResult};
 
 /// How long a transient status/error message stays on screen before clearing.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -114,6 +115,10 @@ pub enum Mode {
     Filter,
     /// The detail pane is open for the torrent with this id.
     Detail { id: usize },
+    /// The search query prompt is open.
+    SearchInput,
+    /// The search results overlay is open.
+    SearchResults,
 }
 
 /// A merged event fed to [`App::handle`] by the runtime.
@@ -189,6 +194,14 @@ pub struct App {
     pub peer_speeds: HashMap<String, u64>,
     /// Last-seen fetched counter and timestamp per peer, for speed derivation.
     peer_samples: HashMap<String, (u64, Instant)>,
+    /// Results of the last indexer search, sorted by seeders.
+    pub search_results: Vec<SearchResult>,
+    /// Index of the selected row in the search results.
+    pub search_selected: usize,
+    /// Whether a search is in flight (results not yet received).
+    pub search_loading: bool,
+    /// Query the results (or in-flight search) belong to.
+    pub search_query: String,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -220,6 +233,10 @@ impl App {
             history_id: None,
             peer_speeds: HashMap::new(),
             peer_samples: HashMap::new(),
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_loading: false,
+            search_query: String::new(),
             status: None,
             status_is_error: false,
             status_at: None,
@@ -340,7 +357,8 @@ impl App {
             }
             samples.insert(p.addr.clone(), (p.fetched_bytes, now));
         }
-        self.peer_speeds.retain(|addr, _| samples.contains_key(addr));
+        self.peer_speeds
+            .retain(|addr, _| samples.contains_key(addr));
         self.peer_samples = samples;
     }
 
@@ -381,7 +399,7 @@ impl App {
             }
             Event::Input(CrosstermEvent::Paste(text)) => {
                 // A bracketed paste: insert the whole string at the cursor.
-                if self.mode == Mode::AddBar {
+                if matches!(self.mode, Mode::AddBar | Mode::SearchInput) {
                     self.insert_str(&text);
                 }
                 Action::none()
@@ -401,6 +419,8 @@ impl App {
             Mode::Filter => self.handle_filter_key(key),
             Mode::ConfirmRemove { .. } => self.handle_confirm_key(key),
             Mode::Detail { .. } => self.handle_detail_key(key),
+            Mode::SearchInput => self.handle_search_input_key(key),
+            Mode::SearchResults => self.handle_search_results_key(key),
         }
     }
 
@@ -435,6 +455,11 @@ impl App {
                     self.mode = Mode::Filter;
                     Action::none()
                 }
+            }
+            KeyCode::Char('f') => {
+                self.clear_input();
+                self.mode = Mode::SearchInput;
+                Action::none()
             }
             KeyCode::Char('s') => {
                 self.cycle_sort(false);
@@ -515,7 +540,90 @@ impl App {
         }
     }
 
-    /// Text-editing keys shared by the add and filter inputs.
+    fn handle_search_input_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                // Fall back to existing results if there are any.
+                self.mode = if self.search_results.is_empty() && !self.search_loading {
+                    Mode::List
+                } else {
+                    Mode::SearchResults
+                };
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let query = self.input.trim().to_string();
+                self.clear_input();
+                if query.is_empty() {
+                    self.mode = Mode::List;
+                    return Action::none();
+                }
+                self.search_query = query.clone();
+                self.search_results.clear();
+                self.search_selected = 0;
+                self.search_loading = true;
+                self.mode = Mode::SearchResults;
+                Action::cmd(Command::Search(query))
+            }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    fn handle_search_results_key(&mut self, key: KeyEvent) -> Action {
+        let last = self.search_results.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::List;
+                Action::none()
+            }
+            KeyCode::Char('f') | KeyCode::Char('/') => {
+                self.clear_input();
+                self.mode = Mode::SearchInput;
+                Action::none()
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.search_selected = self.search_selected.saturating_sub(1);
+                Action::none()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.search_selected = (self.search_selected + 1).min(last);
+                Action::none()
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.search_selected = 0;
+                Action::none()
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.search_selected = last;
+                Action::none()
+            }
+            // Add the selected result and stay, so several can be queued.
+            KeyCode::Enter => match self.search_results.get(self.search_selected) {
+                Some(hit) => Action::cmd(Command::Add(hit.magnet.clone())),
+                None => Action::none(),
+            },
+            _ => Action::none(),
+        }
+    }
+
+    /// Apply a finished search, ignoring outcomes for superseded queries.
+    pub fn set_search_outcome(&mut self, outcome: SearchOutcome) {
+        if outcome.query != self.search_query {
+            return;
+        }
+        self.search_loading = false;
+        self.search_results = outcome.results;
+        self.search_selected = 0;
+        if !outcome.failed.is_empty() {
+            self.set_status(
+                format!("search failed on: {}", outcome.failed.join(", ")),
+                true,
+            );
+        }
+    }
+
+    /// Text-editing keys shared by the add, filter, and search inputs.
     ///
     /// Returns `Some(action)` when the key was handled, else `None` so callers
     /// can fall through.
@@ -906,6 +1014,52 @@ mod tests {
         a.filter = Some("RA".to_string());
         let filtered: Vec<usize> = a.visible_rows().iter().map(|r| r.id).collect();
         assert_eq!(filtered, vec![2]);
+    }
+
+    #[test]
+    fn search_flow_dispatches_query_and_applies_results() {
+        let mut a = App::new();
+        a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        assert_eq!(a.mode, Mode::SearchInput);
+
+        for c in "ubuntu".chars() {
+            a.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&action.commands[..], [Command::Search(q)] if q == "ubuntu"));
+        assert_eq!(a.mode, Mode::SearchResults);
+        assert!(a.search_loading);
+
+        // A stale outcome for another query is dropped.
+        a.set_search_outcome(SearchOutcome {
+            query: "other".to_string(),
+            results: Vec::new(),
+            failed: Vec::new(),
+        });
+        assert!(a.search_loading);
+
+        let hit = SearchResult {
+            title: "ubuntu-24.04.iso".to_string(),
+            size: 1,
+            seeders: 2,
+            leechers: 3,
+            source: "apibay",
+            magnet: "magnet:?xt=urn:btih:x".to_string(),
+        };
+        a.set_search_outcome(SearchOutcome {
+            query: "ubuntu".to_string(),
+            results: vec![hit],
+            failed: Vec::new(),
+        });
+        assert!(!a.search_loading);
+
+        // Enter adds the selected magnet and stays in the results.
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&action.commands[..], [Command::Add(m)] if m == "magnet:?xt=urn:btih:x"));
+        assert_eq!(a.mode, Mode::SearchResults);
+
+        a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(a.mode, Mode::List);
     }
 
     #[test]

@@ -177,7 +177,10 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(47)), "47s");
         assert_eq!(format_duration(Duration::from_secs(252)), "4m12s");
         assert_eq!(format_duration(Duration::from_secs(3720)), "1h02m");
-        assert_eq!(format_duration(Duration::from_secs(2 * 86_400 + 3 * 3600)), "2d03h");
+        assert_eq!(
+            format_duration(Duration::from_secs(2 * 86_400 + 3 * 3600)),
+            "2d03h"
+        );
     }
 
     #[test]

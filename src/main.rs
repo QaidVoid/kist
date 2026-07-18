@@ -17,6 +17,7 @@ mod engine;
 mod error;
 mod format;
 mod model;
+mod search;
 mod ui;
 
 fn main() -> Result<()> {
@@ -88,6 +89,11 @@ fn run_ui(
         // Drain engine status messages.
         while let Ok(status) = link.status.try_recv() {
             app.set_status(status.message, status.is_error);
+        }
+
+        // Drain finished searches.
+        while let Ok(outcome) = link.search.try_recv() {
+            app.set_search_outcome(outcome);
         }
 
         // Apply a fresh snapshot if the engine published one.

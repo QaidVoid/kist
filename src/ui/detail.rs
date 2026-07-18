@@ -99,7 +99,9 @@ fn tab_line(tab: DetailTab) -> Line<'static> {
         if t == tab {
             spans.push(Span::styled(
                 label,
-                Style::new().fg(ratatui::style::Color::Black).bg(theme::ACCENT),
+                Style::new()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(theme::ACCENT),
             ));
         } else {
             spans.push(Span::styled(label, Style::new().fg(theme::DIM)));
@@ -181,21 +183,30 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
         lines.push(kv_line("Pieces", format!("{have} / {}", pieces.len())));
         lines.push(Line::from(vec![
             Span::raw(format!(" {:<KEY_WIDTH$} ", "")),
-            Span::styled(piece_map(pieces, value_width), Style::new().fg(theme::ACCENT)),
+            Span::styled(
+                piece_map(pieces, value_width),
+                Style::new().fg(theme::ACCENT),
+            ),
         ]));
     }
 
     if value_width >= 8 {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<KEY_WIDTH$} ", "Down"), Style::new().fg(theme::WARN)),
+            Span::styled(
+                format!(" {:<KEY_WIDTH$} ", "Down"),
+                Style::new().fg(theme::WARN),
+            ),
             Span::styled(
                 sparkline(&app.detail_down_history, value_width),
                 Style::new().fg(theme::ACCENT),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<KEY_WIDTH$} ", "Up"), Style::new().fg(theme::WARN)),
+            Span::styled(
+                format!(" {:<KEY_WIDTH$} ", "Up"),
+                Style::new().fg(theme::WARN),
+            ),
             Span::styled(
                 sparkline(&app.detail_up_history, value_width),
                 Style::new().fg(theme::OK),
@@ -294,7 +305,9 @@ fn peer_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
             Style::new().fg(theme::DIM),
         ))];
     }
-    let addr_budget = width.saturating_sub(1 + 2 + 10 + 2 + 10 + 2 + 10).clamp(9, 21);
+    let addr_budget = width
+        .saturating_sub(1 + 2 + 10 + 2 + 10 + 2 + 10)
+        .clamp(9, 21);
     let mut lines = vec![Line::from(Span::styled(
         format!(
             " {:<addr_budget$}  {:<10}  {:>10}  {:>10}",
@@ -335,7 +348,10 @@ fn tracker_lines(d: &DetailSnapshot, width: usize) -> Vec<Line<'static>> {
 /// A labelled key/value line with a themed key and a plain value.
 fn kv_line(key: &str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!(" {:<KEY_WIDTH$} ", key), Style::new().fg(theme::WARN)),
+        Span::styled(
+            format!(" {:<KEY_WIDTH$} ", key),
+            Style::new().fg(theme::WARN),
+        ),
         Span::raw(value),
     ])
 }

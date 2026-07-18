@@ -20,6 +20,7 @@ pub mod detail;
 pub mod filter_bar;
 pub mod help;
 pub mod list;
+pub mod search;
 pub mod theme;
 
 /// Smallest terminal the normal layout supports (columns, rows).
@@ -66,6 +67,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Filter => filter_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
         Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
+        Mode::SearchInput => search::render_input(frame, area, app),
+        Mode::SearchResults => search::render_results(frame, area, app),
         Mode::Detail { .. } | Mode::List => {}
     }
 }
@@ -74,7 +77,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_too_small(frame: &mut Frame, area: Rect) {
     let message = format!("Terminal too small (min {}x{})", MIN_SIZE.0, MIN_SIZE.1);
     let y = area.y + area.height / 2;
-    let line_area = Rect::new(area.x, y.min(area.bottom().saturating_sub(1)), area.width, 1);
+    let line_area = Rect::new(
+        area.x,
+        y.min(area.bottom().saturating_sub(1)),
+        area.width,
+        1,
+    );
     frame.render_widget(
         Paragraph::new(Line::raw(message)).alignment(Alignment::Center),
         line_area,
@@ -205,6 +213,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints: &[(&str, &str)] = match app.mode {
         Mode::AddBar => &[("enter", "add"), ("esc", "cancel")],
         Mode::Filter => &[("enter", "apply"), ("esc", "cancel"), ("blank", "clears")],
+        Mode::SearchInput => &[("enter", "search"), ("esc", "cancel")],
+        Mode::SearchResults => &[
+            ("enter", "download"),
+            ("j/k", "move"),
+            ("f", "new search"),
+            ("esc", "close"),
+        ],
         Mode::Help => &[("esc/?", "close help")],
         Mode::ConfirmRemove { .. } => &[("y", "remove"), ("n/esc", "cancel")],
         Mode::Detail { .. } => &[
@@ -216,6 +231,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         Mode::List => &[
             ("a", "add"),
+            ("f", "search"),
             ("j/k", "move"),
             ("i", "details"),
             ("p", "pause"),

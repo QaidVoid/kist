@@ -7,6 +7,7 @@ kist keeps things minimal: add a torrent, watch it download, and get out of your
 ## Features
 
 - Add torrents from magnet links, `.torrent` files, or URLs
+- Search apibay and download results without leaving the terminal
 - DHT support for magnet links
 - Session persistence, so your torrent list survives restarts
 - Detail pane with overview, files, peers, and trackers tabs
@@ -50,6 +51,7 @@ Press `?` inside kist to see this list at any time.
 | Key | Action |
 | --- | --- |
 | `a` | Add a torrent |
+| `f` | Search indexers (`enter` downloads the selected result) |
 | `j` / `k` | Move down / up |
 | `i` | Open / close torrent details |
 | `tab` | Cycle detail tab (overview, files, peers, trackers) |
