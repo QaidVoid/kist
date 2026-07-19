@@ -5,9 +5,9 @@ use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
-use crate::app::App;
+use crate::app::{App, PendingAdd};
 use crate::format::{format_duration, format_ratio, format_size, format_speed, truncate_end};
-use crate::model::TorrentRow;
+use crate::model::{RowState, TorrentRow};
 use crate::ui::theme;
 
 /// Space the percent label occupies after the progress bar: ` 100.0%`.
@@ -108,10 +108,14 @@ fn fit_columns(width: u16) -> (Vec<&'static Col>, u16) {
 }
 
 /// Render the torrent list (or its empty state).
+///
+/// Adds still resolving metadata are appended as placeholder rows so a
+/// dispatched add is visible before the engine registers the torrent; they can
+/// be selected and cancelled with `d`.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = theme::block().title(theme::title(" Torrents ".to_string()));
 
-    if app.snapshot.rows.is_empty() {
+    if app.snapshot.rows.is_empty() && app.pending_adds.is_empty() {
         let lines = vec![
             Line::raw(""),
             Line::from(vec![
@@ -125,7 +129,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let visible = app.visible_rows();
-    if visible.is_empty() {
+    if visible.is_empty() && app.pending_adds.is_empty() {
         let lines = vec![
             Line::raw(""),
             Line::from(vec![
@@ -154,10 +158,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut widths = vec![Constraint::Min(NAME_MIN_WIDTH)];
     widths.extend(cols.iter().map(|c| Constraint::Length(c.width)));
 
-    let rows: Vec<Row> = visible
+    let mut rows: Vec<Row> = visible
         .iter()
         .map(|row| row_for(row, &cols, name_width))
         .collect();
+    rows.extend(
+        app.pending_adds
+            .iter()
+            .map(|p| pending_row(p, &cols, name_width)),
+    );
 
     let mut state = TableState::default().with_selected(Some(app.selected));
     let table = Table::new(rows, widths)
@@ -192,6 +201,26 @@ fn row_for(row: &TorrentRow, cols: &[&Col], name_width: u16) -> Row<'static> {
         cells.push(Cell::from(Line::raw(text).alignment(col.align)));
     }
     Row::new(cells).style(theme::state_style(row.state, row.finished))
+}
+
+/// Placeholder row for an add whose metadata is still resolving.
+fn pending_row(pending: &PendingAdd, cols: &[&Col], name_width: u16) -> Row<'static> {
+    let glyph = theme::state_glyph(RowState::Initializing, false);
+    let name_budget = (name_width as usize).saturating_sub(2);
+    let name = format!("{glyph} {}", truncate_end(&pending.name, name_budget));
+
+    let mut cells = vec![Cell::from(name)];
+    for col in cols {
+        let text = match col.id {
+            ColId::Progress => format!(
+                "resolving\u{2026} {}",
+                format_duration(pending.started.elapsed())
+            ),
+            _ => theme::NONE.to_string(),
+        };
+        cells.push(Cell::from(Line::raw(text).alignment(col.align)));
+    }
+    Row::new(cells).style(theme::state_style(RowState::Initializing, false))
 }
 
 /// Progress bar sized to the cell width, followed by the percent label.

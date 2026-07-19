@@ -36,19 +36,20 @@ fn main() -> Result<()> {
     let mut link = engine::spawn(engine, config.refresh_interval());
 
     // Pre-queue a torrent passed on the command line, if any.
-    if let Some(source) = cli
+    let initial = cli
         .torrent
         .as_deref()
         .map(str::trim)
         .filter(|source| !source.is_empty())
-    {
-        let _ = link.commands.try_send(Command::Add(source.to_string()));
+        .map(str::to_string);
+    if let Some(source) = &initial {
+        let _ = link.commands.try_send(Command::Add(source.clone()));
     }
 
     let refresh = config.refresh_interval();
     let mut terminal =
         ratatui::try_init().map_err(|e| anyhow::anyhow!("failed to initialize terminal: {e}"))?;
-    let ui_result = run_ui(&mut terminal, &mut link, refresh);
+    let ui_result = run_ui(&mut terminal, &mut link, refresh, initial);
     let _ = ratatui::try_restore();
     ui_result?;
 
@@ -66,9 +67,13 @@ fn run_ui(
     terminal: &mut ratatui::DefaultTerminal,
     link: &mut EngineLink,
     refresh: Duration,
+    initial: Option<String>,
 ) -> std::io::Result<()> {
     let mut app = App::new();
     app.update_snapshot(link.snapshots.borrow().clone());
+    if let Some(source) = &initial {
+        app.push_pending_add(source);
+    }
 
     loop {
         app.expire_status();
@@ -88,6 +93,9 @@ fn run_ui(
 
         // Drain engine status messages.
         while let Ok(status) = link.status.try_recv() {
+            if let Some(source) = &status.finished_add {
+                app.finish_pending_add(source);
+            }
             app.set_status(status.message, status.is_error);
         }
 

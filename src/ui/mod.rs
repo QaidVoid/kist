@@ -195,7 +195,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw(format!("  {}", truncate_end(&row.name, name_budget))),
                 ])
             }
-            None => Line::raw(" "),
+            // A selected pending add: show what was dispatched.
+            None => match app.selected_pending() {
+                Some(pending) => Line::from(Span::styled(
+                    format!(" {}", truncate_end(&pending.source, budget)),
+                    Style::new().fg(theme::DIM),
+                )),
+                None => Line::raw(" "),
+            },
         }
     };
     frame.render_widget(line, area);

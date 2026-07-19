@@ -121,6 +121,18 @@ pub enum Mode {
     SearchResults,
 }
 
+/// An add that was dispatched to the engine but has not completed yet, e.g. a
+/// magnet still resolving metadata. Shown in the list until the engine reports
+/// the outcome.
+pub struct PendingAdd {
+    /// The source string the add was dispatched with, for correlation.
+    pub source: String,
+    /// Human-friendly display name.
+    pub name: String,
+    /// When the add was dispatched, for the elapsed indicator.
+    pub started: Instant,
+}
+
 /// A merged event fed to [`App::handle`] by the runtime.
 #[derive(Debug)]
 pub enum Event {
@@ -194,6 +206,8 @@ pub struct App {
     pub peer_speeds: HashMap<String, u64>,
     /// Last-seen fetched counter and timestamp per peer, for speed derivation.
     peer_samples: HashMap<String, (u64, Instant)>,
+    /// Adds dispatched to the engine that have not completed yet.
+    pub pending_adds: Vec<PendingAdd>,
     /// Results of the last indexer search, sorted by seeders.
     pub search_results: Vec<SearchResult>,
     /// Index of the selected row in the search results.
@@ -233,6 +247,7 @@ impl App {
             history_id: None,
             peer_speeds: HashMap::new(),
             peer_samples: HashMap::new(),
+            pending_adds: Vec::new(),
             search_results: Vec::new(),
             search_selected: 0,
             search_loading: false,
@@ -279,9 +294,14 @@ impl App {
         rows
     }
 
+    /// Number of selectable list rows: visible torrents plus pending adds.
+    fn list_len(&self) -> usize {
+        self.visible_rows().len() + self.pending_adds.len()
+    }
+
     /// Keep `selected` within the bounds of the visible list.
     fn clamp_selection(&mut self) {
-        let len = self.visible_rows().len();
+        let len = self.list_len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
@@ -485,13 +505,15 @@ impl App {
             KeyCode::Char('p') | KeyCode::Char(' ') => self.cmd_for_selected(Command::Pause),
             KeyCode::Char('r') => self.cmd_for_selected(Command::Resume),
             KeyCode::Char('d') | KeyCode::Delete => {
-                // Removal is destructive, so confirm first.
-                match self.selected_id() {
-                    Some(id) => {
-                        self.mode = Mode::ConfirmRemove { id };
-                        Action::none()
-                    }
-                    None => Action::none(),
+                // Removal is destructive, so confirm first. Cancelling a
+                // pending add loses nothing, so it needs no confirmation.
+                if let Some(id) = self.selected_id() {
+                    self.mode = Mode::ConfirmRemove { id };
+                    Action::none()
+                } else if let Some(pending) = self.selected_pending() {
+                    Action::cmd(Command::CancelAdd(pending.source.clone()))
+                } else {
+                    Action::none()
                 }
             }
             KeyCode::Enter => self.toggle_pause_resume(),
@@ -513,10 +535,29 @@ impl App {
                 if source.is_empty() {
                     Action::none()
                 } else {
+                    self.push_pending_add(&source);
                     Action::cmd(Command::Add(source))
                 }
             }
             _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    /// Track a dispatched add so the list can show it until the engine reports
+    /// the outcome.
+    pub fn push_pending_add(&mut self, source: &str) {
+        self.pending_adds.push(PendingAdd {
+            name: add_display_name(source),
+            source: source.to_string(),
+            started: Instant::now(),
+        });
+    }
+
+    /// Drop the pending marker for a completed add.
+    pub fn finish_pending_add(&mut self, source: &str) {
+        if let Some(i) = self.pending_adds.iter().position(|p| p.source == source) {
+            self.pending_adds.remove(i);
+            self.clamp_selection();
         }
     }
 
@@ -599,10 +640,19 @@ impl App {
                 Action::none()
             }
             // Add the selected result and stay, so several can be queued.
-            KeyCode::Enter => match self.search_results.get(self.search_selected) {
-                Some(hit) => Action::cmd(Command::Add(hit.magnet.clone())),
-                None => Action::none(),
-            },
+            KeyCode::Enter => {
+                let magnet = self
+                    .search_results
+                    .get(self.search_selected)
+                    .map(|hit| hit.magnet.clone());
+                match magnet {
+                    Some(magnet) => {
+                        self.push_pending_add(&magnet);
+                        Action::cmd(Command::Add(magnet))
+                    }
+                    None => Action::none(),
+                }
+            }
             _ => Action::none(),
         }
     }
@@ -774,7 +824,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        let len = self.visible_rows().len();
+        let len = self.list_len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -898,12 +948,73 @@ impl App {
     fn selected_id(&self) -> Option<usize> {
         self.visible_rows().get(self.selected).map(|row| row.id)
     }
+
+    /// The pending add under the selection, if the selection is past the real
+    /// torrents (pending rows render after them).
+    pub fn selected_pending(&self) -> Option<&PendingAdd> {
+        self.pending_adds
+            .get(self.selected.checked_sub(self.visible_rows().len())?)
+    }
 }
 
 impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Human-friendly name for a pending add: the magnet's `dn` parameter when
+/// present, otherwise the source string itself.
+fn add_display_name(source: &str) -> String {
+    if let Some(query) = source.strip_prefix("magnet:?") {
+        for param in query.split('&') {
+            if let Some(value) = param.strip_prefix("dn=") {
+                let decoded = percent_decode(value);
+                if !decoded.is_empty() {
+                    return decoded;
+                }
+            }
+        }
+    }
+    source.to_string()
+}
+
+/// Decode percent-encoding (and `+` as space), keeping invalid sequences as-is.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Push a sample, dropping the oldest once the history is full.
@@ -1017,6 +1128,71 @@ mod tests {
     }
 
     #[test]
+    fn add_tracks_pending_until_engine_reports() {
+        let mut a = App::new();
+        a.mode = Mode::AddBar;
+        let source = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=My%20File+v2";
+        a.input = source.to_string();
+        a.cursor = a.input.len();
+
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&action.commands[..], [Command::Add(s)] if s == source));
+        assert_eq!(a.pending_adds.len(), 1);
+        assert_eq!(a.pending_adds[0].name, "My File v2");
+
+        // Completion for another source leaves the marker alone.
+        a.finish_pending_add("magnet:?xt=urn:btih:other");
+        assert_eq!(a.pending_adds.len(), 1);
+
+        a.finish_pending_add(source);
+        assert!(a.pending_adds.is_empty());
+    }
+
+    #[test]
+    fn pending_add_is_selectable_and_cancellable() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(0, "alpha", RowState::Live, 0.5, 10)]);
+        a.push_pending_add("magnet:?xt=urn:btih:abc");
+
+        // The selection extends past the real torrents onto the pending row.
+        a.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(a.selected, 1);
+        assert!(a.selected_pending().is_some());
+
+        // `d` on a pending row cancels it directly (no confirm dialog).
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(
+            matches!(&action.commands[..], [Command::CancelAdd(s)] if s == "magnet:?xt=urn:btih:abc")
+        );
+        assert_eq!(a.mode, Mode::List);
+
+        // The engine's cancel status clears the row and reclamps the selection.
+        a.finish_pending_add("magnet:?xt=urn:btih:abc");
+        assert_eq!(a.selected, 0);
+
+        // `d` on a real torrent still asks for confirmation.
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(action.commands.is_empty());
+        assert_eq!(a.mode, Mode::ConfirmRemove { id: 0 });
+    }
+
+    #[test]
+    fn add_display_name_falls_back_to_source() {
+        assert_eq!(
+            add_display_name("/path/to/file.torrent"),
+            "/path/to/file.torrent"
+        );
+        assert_eq!(
+            add_display_name("magnet:?xt=urn:btih:abc"),
+            "magnet:?xt=urn:btih:abc"
+        );
+        assert_eq!(
+            add_display_name("magnet:?dn=a%C3%A9b&xt=urn:btih:abc"),
+            "aéb"
+        );
+    }
+
+    #[test]
     fn search_flow_dispatches_query_and_applies_results() {
         let mut a = App::new();
         a.handle_key(KeyEvent::from(KeyCode::Char('f')));
@@ -1053,10 +1229,11 @@ mod tests {
         });
         assert!(!a.search_loading);
 
-        // Enter adds the selected magnet and stays in the results.
+        // Enter adds the selected magnet, tracks it, and stays in the results.
         let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(&action.commands[..], [Command::Add(m)] if m == "magnet:?xt=urn:btih:x"));
         assert_eq!(a.mode, Mode::SearchResults);
+        assert_eq!(a.pending_adds.len(), 1);
 
         a.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(a.mode, Mode::List);

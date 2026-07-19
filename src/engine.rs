@@ -5,6 +5,7 @@
 //! on a background task, taking commands on a channel and publishing snapshots
 //! (and status messages) back to the UI.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use librqbit::{
     TorrentStats, TorrentStatsState,
 };
 use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
 
 use crate::config::Config;
 use crate::error;
@@ -265,6 +267,9 @@ fn mbps_to_bytes(mbps: f64) -> u64 {
 pub enum Command {
     /// Add a torrent from the given source string.
     Add(String),
+    /// Abort an in-flight add (e.g. a magnet stuck resolving metadata),
+    /// identified by its source string.
+    CancelAdd(String),
     /// Pause a torrent by id.
     Pause(usize),
     /// Resume a torrent by id.
@@ -287,6 +292,9 @@ pub struct EngineStatus {
     pub message: String,
     /// Whether this originated from an error.
     pub is_error: bool,
+    /// Source of a completed [`Command::Add`] (success or failure), so the UI
+    /// can clear its pending-add marker.
+    pub finished_add: Option<String>,
 }
 
 /// Connection back to the UI from a spawned engine task.
@@ -321,6 +329,9 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
         let mut ticker = tokio::time::interval(refresh);
         // Torrent id currently shown in the detail pane, if any.
         let mut detail_id: Option<usize> = None;
+        // Abort handles for in-flight adds, keyed by source, so a stuck add
+        // (e.g. an unresolvable magnet) can be cancelled.
+        let mut add_tasks: HashMap<String, AbortHandle> = HashMap::new();
         loop {
             tokio::select! {
                 biased;
@@ -339,6 +350,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                                     let _ = status_tx.send(EngineStatus {
                                         message: format!("torrent {id} not found"),
                                         is_error: true,
+                                        finished_add: None,
                                     });
                                 }
                             }
@@ -354,6 +366,35 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                             tokio::spawn(async move {
                                 let _ = search_tx.send(search::search(query).await);
                             });
+                        }
+                        // Adds keep an abort handle so they can be cancelled
+                        // while metadata is still resolving.
+                        Command::Add(source) => {
+                            let engine = engine.clone();
+                            let snapshot_tx = snapshot_tx.clone();
+                            let status_tx = status_tx.clone();
+                            let cmd = Command::Add(source.clone());
+                            let task = tokio::spawn(async move {
+                                if let Some(status) = handle_command(&engine, cmd).await {
+                                    let _ = status_tx.send(status);
+                                }
+                                let _ = snapshot_tx.send(engine.snapshot());
+                            });
+                            add_tasks.insert(source, task.abort_handle());
+                        }
+                        Command::CancelAdd(source) => {
+                            // A finished task means the real outcome is already
+                            // on the status channel; stay silent then.
+                            if let Some(handle) = add_tasks.remove(&source)
+                                && !handle.is_finished()
+                            {
+                                handle.abort();
+                                let _ = status_tx.send(EngineStatus {
+                                    message: "cancelled add".to_string(),
+                                    is_error: false,
+                                    finished_add: Some(source),
+                                });
+                            }
                         }
                         // Action commands run in their own task so a slow
                         // operation (e.g. resolving magnet metadata over the
@@ -372,6 +413,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                     }
                 }
                 _ = ticker.tick() => {
+                    add_tasks.retain(|_, handle| !handle.is_finished());
                     let _ = snapshot_tx.send(engine.snapshot());
                     if let Some(id) = detail_id {
                         match engine.detail(id) {
@@ -398,11 +440,16 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
 
 /// Apply a single action command, returning a status message if one should be shown.
 async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
+    let mut finished_add = None;
     let result: Result<String> = match cmd {
-        Command::Add(source) => engine
-            .add(source)
-            .await
-            .map(|_| "added torrent".to_string()),
+        Command::Add(source) => {
+            let result = engine
+                .add(source.clone())
+                .await
+                .map(|_| "added torrent".to_string());
+            finished_add = Some(source);
+            result
+        }
         Command::Pause(id) => engine
             .pause(id)
             .await
@@ -415,8 +462,12 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             .remove(id)
             .await
             .map(|_| format!("removed torrent {id}")),
-        // Detail, search, and quit are handled by the spawn loop, not here.
-        Command::FetchDetail(_) | Command::StopDetail | Command::Search(_) | Command::Quit => {
+        // Detail, search, cancel, and quit are handled by the spawn loop, not here.
+        Command::FetchDetail(_)
+        | Command::StopDetail
+        | Command::Search(_)
+        | Command::CancelAdd(_)
+        | Command::Quit => {
             return None;
         }
     };
@@ -424,10 +475,12 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
         Ok(message) => Some(EngineStatus {
             message,
             is_error: false,
+            finished_add,
         }),
         Err(e) => Some(EngineStatus {
             message: error::to_status_line(&e),
             is_error: true,
+            finished_add,
         }),
     }
 }

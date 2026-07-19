@@ -37,7 +37,10 @@ pub fn render(frame: &mut Frame, area: Rect) {
         Line::from(vec![key("p / spc"), desc("pause selected")]),
         Line::from(vec![key("r"), desc("resume selected")]),
         Line::from(vec![key("enter"), desc("toggle pause / resume")]),
-        Line::from(vec![key("d"), desc("remove (asks to confirm)")]),
+        Line::from(vec![
+            key("d"),
+            desc("remove (confirms) / cancel pending add"),
+        ]),
         Line::from(vec![key("y / n"), desc("confirm / cancel removal")]),
         Line::from(vec![key("/"), desc("filter by name (blank clears)")]),
         Line::from(vec![key("s"), desc("cycle sort column")]),
