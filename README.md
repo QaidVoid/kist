@@ -51,18 +51,21 @@ Press `?` inside kist to see this list at any time.
 | Key | Action |
 | --- | --- |
 | `a` | Add a torrent |
+| `A` | Add with options (start paused, output folder, pick files) |
 | `f` | Search indexers (`enter` downloads the selected result) |
 | `j` / `k` | Move down / up |
 | `i` | Open / close torrent details |
 | `tab` | Cycle detail tab (overview, files, peers, trackers) |
+| `space` | In the files tab, include / exclude the highlighted file |
 | `ctrl+d` / `ctrl+u` | Scroll detail content (also `pgdn` / `pgup`) |
 | `g` / `G` | Detail top / bottom (also `home` / `end`) |
 | `p` / `space` | Pause selected |
 | `r` | Resume selected |
 | `enter` | Toggle pause / resume |
 | `d` | Remove (asks to confirm) |
-| `y` / `n` | Confirm / cancel removal |
+| `f` / `D` | In the confirm dialog: forget (keep files) / delete with files |
 | `/` | Filter by name (blank clears) |
+| `L` | Set global rate limits (`down up`, e.g. `2M 512K`; `-` clears) |
 | `s` | Cycle sort column |
 | `S` | Reverse sort direction |
 | `?` | Toggle help |
@@ -80,6 +83,11 @@ download_directory = "/home/you/Downloads"
 
 # Inclusive port range for incoming peer connections.
 listen_ports = [6881, 6889]
+
+# Global speed caps as human sizes (e.g. "2M", "512K"); omit for unlimited.
+# These can also be changed live with the `L` key.
+download_limit = "2M"
+upload_limit = "512K"
 
 # Enable the DHT (needed for magnet links).
 enable_dht = true

@@ -28,6 +28,12 @@ pub struct Config {
     pub enable_session_persistence: bool,
     /// UI refresh interval in milliseconds.
     pub refresh_interval_ms: u64,
+    /// Global download speed cap as a human size (e.g. `"2M"`); absent means
+    /// unlimited.
+    pub download_limit: Option<String>,
+    /// Global upload speed cap as a human size (e.g. `"512K"`); absent means
+    /// unlimited.
+    pub upload_limit: Option<String>,
 }
 
 impl Default for Config {
@@ -38,6 +44,8 @@ impl Default for Config {
             enable_dht: true,
             enable_session_persistence: true,
             refresh_interval_ms: 250,
+            download_limit: None,
+            upload_limit: None,
         }
     }
 }
@@ -54,6 +62,22 @@ impl Config {
         let start = self.listen_ports[0];
         let end = self.listen_ports[1].max(start);
         start..end.saturating_add(1)
+    }
+
+    /// Configured global download cap in bytes per second, if any. An
+    /// unparseable value is treated as unlimited.
+    pub fn download_limit_bps(&self) -> Option<u32> {
+        self.download_limit
+            .as_deref()
+            .and_then(crate::format::parse_rate)
+    }
+
+    /// Configured global upload cap in bytes per second, if any. An unparseable
+    /// value is treated as unlimited.
+    pub fn upload_limit_bps(&self) -> Option<u32> {
+        self.upload_limit
+            .as_deref()
+            .and_then(crate::format::parse_rate)
     }
 
     /// Apply command-line overrides on top of the loaded config.

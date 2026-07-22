@@ -5,12 +5,12 @@
 //! via an [`Action`]. Rendering is pure given an `App`, so this module has no
 //! dependency on ratatui.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::Command;
+use crate::engine::{Command, PreviewOutcome};
 use crate::model::{DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
 use crate::search::{SearchOutcome, SearchResult};
 
@@ -113,12 +113,22 @@ pub enum Mode {
     ConfirmRemove { id: usize },
     /// The list filter entry prompt is open.
     Filter,
+    /// The global rate-limits prompt is open.
+    Limits,
     /// The detail pane is open for the torrent with this id.
     Detail { id: usize },
     /// The search query prompt is open.
     SearchInput,
     /// The search results overlay is open.
     SearchResults,
+    /// The add-with-options source prompt is open.
+    AddOptionsSource,
+    /// The add-with-options form is open.
+    AddOptions,
+    /// The add-with-options output-folder prompt is open.
+    AddOptionsFolder,
+    /// The add-with-options file selection list is open.
+    AddOptionsFiles,
 }
 
 /// An add that was dispatched to the engine but has not completed yet, e.g. a
@@ -131,6 +141,95 @@ pub struct PendingAdd {
     pub name: String,
     /// When the add was dispatched, for the elapsed indicator.
     pub started: Instant,
+}
+
+/// One file in the add-options preview, with its selection state.
+pub struct PreviewFileState {
+    /// Path of the file relative to the download root.
+    pub name: String,
+    /// Total size in bytes.
+    pub size: u64,
+    /// Whether the file is selected for download.
+    pub included: bool,
+}
+
+/// State of an in-progress add-with-options flow.
+pub struct AddOptionsState {
+    /// The source string being added.
+    pub source: String,
+    /// Whether to start the torrent paused.
+    pub paused: bool,
+    /// Output folder override; empty means the session default.
+    pub output_folder: String,
+    /// Previewed files, empty until a preview completes.
+    pub files: Vec<PreviewFileState>,
+    /// Index of the highlighted file in the selection list.
+    pub file_selected: usize,
+    /// Whether a preview request is in flight.
+    pub preview_loading: bool,
+}
+
+impl AddOptionsState {
+    fn new(source: String) -> Self {
+        Self {
+            source,
+            paused: false,
+            output_folder: String::new(),
+            files: Vec::new(),
+            file_selected: 0,
+            preview_loading: false,
+        }
+    }
+
+    /// File indices to download: `None` when all files are selected (the
+    /// librqbit default), else the selected subset.
+    fn only_files(&self) -> Option<Vec<usize>> {
+        if self.files.is_empty() || self.files.iter().all(|f| f.included) {
+            return None;
+        }
+        Some(
+            self.files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.included)
+                .map(|(i, _)| i)
+                .collect(),
+        )
+    }
+}
+
+/// Which field of the limits form is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitField {
+    Down,
+    Up,
+}
+
+/// State of the two-field global rate-limits form.
+#[derive(Debug, Clone, Default)]
+pub struct LimitsForm {
+    /// Download field text (empty means unlimited).
+    pub down: String,
+    /// Upload field text (empty means unlimited).
+    pub up: String,
+    /// Currently focused field.
+    pub field: LimitField,
+}
+
+impl Default for LimitField {
+    fn default() -> Self {
+        Self::Down
+    }
+}
+
+impl LimitsForm {
+    /// The buffer for the focused field.
+    fn focused_mut(&mut self) -> &mut String {
+        match self.field {
+            LimitField::Down => &mut self.down,
+            LimitField::Up => &mut self.up,
+        }
+    }
 }
 
 /// A merged event fed to [`App::handle`] by the runtime.
@@ -191,6 +290,8 @@ pub struct App {
     pub detail: Option<DetailSnapshot>,
     /// Active tab of the detail pane.
     pub detail_tab: DetailTab,
+    /// Index of the highlighted file in the detail Files tab.
+    pub detail_file_selected: usize,
     /// Vertical scroll offset, in lines, of the detail pane content.
     pub detail_scroll: u16,
     /// Height of the detail content viewport from the last render, used to size
@@ -216,6 +317,14 @@ pub struct App {
     pub search_loading: bool,
     /// Query the results (or in-flight search) belong to.
     pub search_query: String,
+    /// Active global download cap in bytes per second, if any (for display).
+    pub down_limit: Option<u32>,
+    /// Active global upload cap in bytes per second, if any (for display).
+    pub up_limit: Option<u32>,
+    /// State of the limits form while it is open.
+    pub limits_form: LimitsForm,
+    /// State of an in-progress add-with-options flow, if any.
+    pub add_options: Option<AddOptionsState>,
     /// Latest status/error message to display, if any.
     pub status: Option<String>,
     /// Whether the current status is an error (for coloring).
@@ -240,6 +349,7 @@ impl App {
             filter: None,
             detail: None,
             detail_tab: DetailTab::default(),
+            detail_file_selected: 0,
             detail_scroll: 0,
             detail_page: 0,
             detail_down_history: VecDeque::new(),
@@ -252,6 +362,10 @@ impl App {
             search_selected: 0,
             search_loading: false,
             search_query: String::new(),
+            down_limit: None,
+            up_limit: None,
+            limits_form: LimitsForm::default(),
+            add_options: None,
             status: None,
             status_is_error: false,
             status_at: None,
@@ -419,7 +533,14 @@ impl App {
             }
             Event::Input(CrosstermEvent::Paste(text)) => {
                 // A bracketed paste: insert the whole string at the cursor.
-                if matches!(self.mode, Mode::AddBar | Mode::SearchInput) {
+                if matches!(
+                    self.mode,
+                    Mode::AddBar
+                        | Mode::SearchInput
+                        | Mode::Filter
+                        | Mode::AddOptionsSource
+                        | Mode::AddOptionsFolder
+                ) {
                     self.insert_str(&text);
                 }
                 Action::none()
@@ -437,10 +558,15 @@ impl App {
             Mode::AddBar => self.handle_add_key(key),
             Mode::Help => self.handle_help_key(key),
             Mode::Filter => self.handle_filter_key(key),
+            Mode::Limits => self.handle_limits_key(key),
             Mode::ConfirmRemove { .. } => self.handle_confirm_key(key),
             Mode::Detail { .. } => self.handle_detail_key(key),
             Mode::SearchInput => self.handle_search_input_key(key),
             Mode::SearchResults => self.handle_search_results_key(key),
+            Mode::AddOptionsSource => self.handle_add_options_source_key(key),
+            Mode::AddOptions => self.handle_add_options_key(key),
+            Mode::AddOptionsFolder => self.handle_add_options_folder_key(key),
+            Mode::AddOptionsFiles => self.handle_add_options_files_key(key),
         }
     }
 
@@ -461,6 +587,26 @@ impl App {
             KeyCode::Char('a') => {
                 self.clear_input();
                 self.mode = Mode::AddBar;
+                Action::none()
+            }
+            KeyCode::Char('A') => {
+                self.clear_input();
+                self.mode = Mode::AddOptionsSource;
+                Action::none()
+            }
+            KeyCode::Char('L') => {
+                self.limits_form = LimitsForm {
+                    down: self
+                        .down_limit
+                        .map(crate::format::format_rate)
+                        .unwrap_or_default(),
+                    up: self
+                        .up_limit
+                        .map(crate::format::format_rate)
+                        .unwrap_or_default(),
+                    field: LimitField::Down,
+                };
+                self.mode = Mode::Limits;
                 Action::none()
             }
             KeyCode::Char('/') => {
@@ -581,6 +727,44 @@ impl App {
         }
     }
 
+    fn handle_limits_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+                Action::none()
+            }
+            // Tab and the arrow keys move between the two fields.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                self.limits_form.field = match self.limits_form.field {
+                    LimitField::Down => LimitField::Up,
+                    LimitField::Up => LimitField::Down,
+                };
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let down = limit_from_token(Some(self.limits_form.down.trim()));
+                let up = limit_from_token(Some(self.limits_form.up.trim()));
+                self.mode = Mode::List;
+                self.down_limit = down;
+                self.up_limit = up;
+                Action::cmd(Command::SetLimits { down, up })
+            }
+            KeyCode::Backspace => {
+                self.limits_form.focused_mut().pop();
+                Action::none()
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.limits_form.focused_mut().push(c);
+                Action::none()
+            }
+            _ => Action::none(),
+        }
+    }
+
     fn handle_search_input_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => {
@@ -673,6 +857,179 @@ impl App {
         }
     }
 
+    fn handle_add_options_source_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                self.mode = Mode::List;
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let source = self.input.trim().to_string();
+                self.clear_input();
+                if source.is_empty() {
+                    self.mode = Mode::List;
+                } else {
+                    self.add_options = Some(AddOptionsState::new(source));
+                    self.mode = Mode::AddOptions;
+                }
+                Action::none()
+            }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    fn handle_add_options_key(&mut self, key: KeyEvent) -> Action {
+        let Some(state) = &mut self.add_options else {
+            self.mode = Mode::List;
+            return Action::none();
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.add_options = None;
+                self.mode = Mode::List;
+                Action::none()
+            }
+            KeyCode::Char('p') => {
+                state.paused = !state.paused;
+                Action::none()
+            }
+            KeyCode::Char('o') => {
+                self.input = state.output_folder.clone();
+                self.cursor = self.input.len();
+                self.mode = Mode::AddOptionsFolder;
+                Action::none()
+            }
+            KeyCode::Char('f') => {
+                if state.preview_loading {
+                    Action::none()
+                } else {
+                    state.preview_loading = true;
+                    Action::cmd(Command::PreviewAdd(state.source.clone()))
+                }
+            }
+            KeyCode::Enter => {
+                let source = state.source.clone();
+                let paused = state.paused;
+                let output_folder = if state.output_folder.trim().is_empty() {
+                    None
+                } else {
+                    Some(state.output_folder.trim().to_string())
+                };
+                let only_files = state.only_files();
+                self.add_options = None;
+                self.mode = Mode::List;
+                self.push_pending_add(&source);
+                Action::cmd(Command::AddWithOptions {
+                    source,
+                    paused,
+                    output_folder,
+                    only_files,
+                })
+            }
+            _ => Action::none(),
+        }
+    }
+
+    fn handle_add_options_folder_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                self.mode = Mode::AddOptions;
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let folder = self.input.trim().to_string();
+                self.clear_input();
+                if let Some(state) = &mut self.add_options {
+                    state.output_folder = folder;
+                }
+                self.mode = Mode::AddOptions;
+                Action::none()
+            }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
+    }
+
+    fn handle_add_options_files_key(&mut self, key: KeyEvent) -> Action {
+        let Some(state) = &mut self.add_options else {
+            self.mode = Mode::List;
+            return Action::none();
+        };
+        let last = state.files.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.mode = Mode::AddOptions;
+                Action::none()
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.file_selected = state.file_selected.saturating_sub(1);
+                Action::none()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.file_selected = (state.file_selected + 1).min(last);
+                Action::none()
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                state.file_selected = 0;
+                Action::none()
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                state.file_selected = last;
+                Action::none()
+            }
+            KeyCode::Char(' ') => {
+                let included_count = state.files.iter().filter(|f| f.included).count();
+                if let Some(file) = state.files.get_mut(state.file_selected) {
+                    // Keep at least one file selected.
+                    if !(file.included && included_count == 1) {
+                        file.included = !file.included;
+                    }
+                }
+                Action::none()
+            }
+            _ => Action::none(),
+        }
+    }
+
+    /// Apply a finished add-options preview, ignoring stale outcomes.
+    pub fn set_preview_outcome(&mut self, outcome: PreviewOutcome) {
+        let matches = self
+            .add_options
+            .as_ref()
+            .is_some_and(|s| s.source == outcome.source);
+        if !matches {
+            return;
+        }
+        if let Some(error) = outcome.error {
+            if let Some(state) = &mut self.add_options {
+                state.preview_loading = false;
+            }
+            self.set_status(error, true);
+            return;
+        }
+        if let Some(state) = &mut self.add_options {
+            state.preview_loading = false;
+            state.files = outcome
+                .files
+                .into_iter()
+                .map(|f| PreviewFileState {
+                    name: f.name,
+                    size: f.size,
+                    included: true,
+                })
+                .collect();
+            state.file_selected = 0;
+        }
+        if self
+            .add_options
+            .as_ref()
+            .is_some_and(|s| !s.files.is_empty())
+        {
+            self.mode = Mode::AddOptionsFiles;
+        }
+    }
+
     /// Text-editing keys shared by the add, filter, and search inputs.
     ///
     /// Returns `Some(action)` when the key was handled, else `None` so callers
@@ -737,12 +1094,16 @@ impl App {
         let Mode::ConfirmRemove { id } = self.mode else {
             return Action::none();
         };
-        // Only an explicit "yes" confirms; everything else cancels (including
-        // unrecognized keys, per the default-cancel requirement).
+        // Forget keeps files; the destructive delete needs Shift+D so it is
+        // never the habitual key. Everything else cancels (default-cancel).
         match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('f') | KeyCode::Enter => {
                 self.mode = Mode::List;
                 Action::cmd(Command::Remove(id))
+            }
+            KeyCode::Char('D') => {
+                self.mode = Mode::List;
+                Action::cmd(Command::RemoveWithData(id))
             }
             _ => {
                 self.mode = Mode::List;
@@ -756,12 +1117,25 @@ impl App {
             KeyCode::Tab => {
                 self.detail_tab = self.detail_tab.next();
                 self.detail_scroll = 0;
+                self.detail_file_selected = 0;
                 Action::none()
             }
             KeyCode::Char('i') | KeyCode::Esc => {
                 self.mode = Mode::List;
                 Action::cmd(Command::StopDetail)
             }
+            // In the Files tab, j/k move the file cursor; elsewhere they change
+            // the torrent the pane is focused on.
+            KeyCode::Up | KeyCode::Char('k') if self.detail_tab == DetailTab::Files => {
+                self.detail_file_selected = self.detail_file_selected.saturating_sub(1);
+                Action::none()
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.detail_tab == DetailTab::Files => {
+                let last = self.detail_files_len().saturating_sub(1);
+                self.detail_file_selected = (self.detail_file_selected + 1).min(last);
+                Action::none()
+            }
+            KeyCode::Char(' ') if self.detail_tab == DetailTab::Files => self.toggle_detail_file(),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
                 self.refocus_detail()
@@ -808,6 +1182,7 @@ impl App {
         match self.selected_id() {
             Some(id) => {
                 self.detail_scroll = 0;
+                self.detail_file_selected = 0;
                 self.mode = Mode::Detail { id };
                 Action::cmd(Command::FetchDetail(id))
             }
@@ -816,6 +1191,37 @@ impl App {
                 Action::cmd(Command::StopDetail)
             }
         }
+    }
+
+    /// Number of files in the current detail snapshot.
+    fn detail_files_len(&self) -> usize {
+        self.detail.as_ref().map_or(0, |d| d.files.len())
+    }
+
+    /// Toggle inclusion of the highlighted file, keeping at least one file
+    /// selected (librqbit rejects an empty selection).
+    fn toggle_detail_file(&mut self) -> Action {
+        let Mode::Detail { id } = self.mode else {
+            return Action::none();
+        };
+        let Some(detail) = &self.detail else {
+            return Action::none();
+        };
+        if detail.files.is_empty() {
+            return Action::none();
+        }
+        let sel = self.detail_file_selected.min(detail.files.len() - 1);
+        let included: HashSet<usize> = detail
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| if *i == sel { !f.included } else { f.included })
+            .map(|(i, _)| i)
+            .collect();
+        if included.is_empty() {
+            return Action::none();
+        }
+        Action::cmd(Command::SetFiles { id, included })
     }
 
     /// Half the detail viewport height, at least one line, for Ctrl+D/Ctrl+U.
@@ -1015,6 +1421,14 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse one token of the limits prompt: absent or `-` means unlimited.
+fn limit_from_token(token: Option<&str>) -> Option<u32> {
+    match token {
+        None | Some("-") => None,
+        Some(s) => crate::format::parse_rate(s),
+    }
 }
 
 /// Push a sample, dropping the oldest once the history is full.
@@ -1253,5 +1667,188 @@ mod tests {
         a.cycle_sort(true);
         let after = a.visible_rows().get(a.selected).map(|r| r.id);
         assert_eq!(before, after);
+    }
+
+    fn type_str(a: &mut App, s: &str) {
+        for c in s.chars() {
+            a.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+    }
+
+    fn detail_with_files(id: usize, included: &[bool]) -> DetailSnapshot {
+        DetailSnapshot {
+            name: "t".to_string(),
+            infohash: format!("h{id}"),
+            state: RowState::Live,
+            total_bytes: 100,
+            progress_bytes: 0,
+            uploaded_bytes: 0,
+            down_speed: 0,
+            up_speed: 0,
+            eta: None,
+            finished: false,
+            peers: 0,
+            files: included
+                .iter()
+                .enumerate()
+                .map(|(i, inc)| crate::model::DetailFile {
+                    name: format!("f{i}"),
+                    size: 10,
+                    have: 0,
+                    included: *inc,
+                })
+                .collect(),
+            peer_rows: Vec::new(),
+            trackers: Vec::new(),
+            pieces: None,
+        }
+    }
+
+    #[test]
+    fn limits_form_edits_fields_and_applies() {
+        let mut a = App::new();
+        a.handle_key(KeyEvent::from(KeyCode::Char('L')));
+        assert_eq!(a.mode, Mode::Limits);
+
+        // Type the download cap, tab to upload, type its cap.
+        type_str(&mut a, "2M");
+        a.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.limits_form.field, LimitField::Up);
+        type_str(&mut a, "512K");
+
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &action.commands[..],
+            [Command::SetLimits { down: Some(d), up: Some(u) }]
+                if *d == 2 * 1024 * 1024 && *u == 512 * 1024
+        ));
+        assert_eq!(a.down_limit, Some(2 * 1024 * 1024));
+        assert_eq!(a.up_limit, Some(512 * 1024));
+        assert_eq!(a.mode, Mode::List);
+
+        // Reopening seeds the fields from the active caps.
+        a.handle_key(KeyEvent::from(KeyCode::Char('L')));
+        assert_eq!(a.limits_form.down, "2M");
+        assert_eq!(a.limits_form.up, "512K");
+
+        // Clearing the download field leaves it unlimited on apply.
+        a.handle_key(KeyEvent::from(KeyCode::Backspace));
+        a.handle_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(a.limits_form.down.is_empty());
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &action.commands[..],
+            [Command::SetLimits { down: None, up: Some(u) }] if *u == 512 * 1024
+        ));
+        assert_eq!(a.down_limit, None);
+    }
+
+    #[test]
+    fn confirm_offers_forget_delete_and_cancel() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(0, "alpha", RowState::Live, 0.5, 10)]);
+
+        // Forget keeps files.
+        a.mode = Mode::ConfirmRemove { id: 0 };
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(matches!(&action.commands[..], [Command::Remove(0)]));
+        assert_eq!(a.mode, Mode::List);
+
+        // Shift+D deletes with data.
+        a.mode = Mode::ConfirmRemove { id: 0 };
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('D')));
+        assert!(matches!(&action.commands[..], [Command::RemoveWithData(0)]));
+
+        // Any other key cancels.
+        a.mode = Mode::ConfirmRemove { id: 0 };
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(action.commands.is_empty());
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn detail_file_toggle_emits_setfiles() {
+        let mut a = App::new();
+        a.mode = Mode::Detail { id: 7 };
+        a.detail_tab = DetailTab::Files;
+        a.detail = Some(detail_with_files(7, &[true, true, true]));
+
+        // Move to the second file and exclude it.
+        a.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        match &action.commands[..] {
+            [Command::SetFiles { id, included }] => {
+                assert_eq!(*id, 7);
+                assert_eq!(*included, HashSet::from([0, 2]));
+            }
+            other => panic!("expected SetFiles, got {other:?}"),
+        }
+
+        // Excluding the last remaining file is refused (never empty).
+        a.detail = Some(detail_with_files(7, &[true, false, false]));
+        a.detail_file_selected = 0;
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(action.commands.is_empty());
+    }
+
+    #[test]
+    fn add_options_flow_builds_command() {
+        let mut a = App::new();
+        a.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert_eq!(a.mode, Mode::AddOptionsSource);
+        type_str(&mut a, "magnet:?xt=urn:btih:abc");
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.mode, Mode::AddOptions);
+
+        // Toggle paused on.
+        a.handle_key(KeyEvent::from(KeyCode::Char('p')));
+        assert!(a.add_options.as_ref().unwrap().paused);
+
+        // Request a preview, then apply its outcome.
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(
+            matches!(&action.commands[..], [Command::PreviewAdd(s)] if s == "magnet:?xt=urn:btih:abc")
+        );
+        a.set_preview_outcome(PreviewOutcome {
+            source: "magnet:?xt=urn:btih:abc".to_string(),
+            files: vec![
+                crate::model::PreviewFile {
+                    name: "a".to_string(),
+                    size: 1,
+                },
+                crate::model::PreviewFile {
+                    name: "b".to_string(),
+                    size: 2,
+                },
+            ],
+            error: None,
+        });
+        assert_eq!(a.mode, Mode::AddOptionsFiles);
+
+        // Exclude the first file, return to the form, and add.
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(action.commands.is_empty());
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.mode, Mode::AddOptions);
+
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        match &action.commands[..] {
+            [
+                Command::AddWithOptions {
+                    source,
+                    paused,
+                    output_folder,
+                    only_files,
+                },
+            ] => {
+                assert_eq!(source, "magnet:?xt=urn:btih:abc");
+                assert!(*paused);
+                assert_eq!(*output_folder, None);
+                assert_eq!(*only_files, Some(vec![1]));
+            }
+            other => panic!("expected AddWithOptions, got {other:?}"),
+        }
+        assert_eq!(a.pending_adds.len(), 1);
+        assert_eq!(a.mode, Mode::List);
     }
 }

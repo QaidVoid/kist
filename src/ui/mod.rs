@@ -15,10 +15,12 @@ use crate::format::{display_width, format_speed, truncate_end};
 use crate::model::RowState;
 
 pub mod add_bar;
+pub mod add_options;
 pub mod confirm;
 pub mod detail;
 pub mod filter_bar;
 pub mod help;
+pub mod limits_bar;
 pub mod list;
 pub mod search;
 pub mod theme;
@@ -63,12 +65,24 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, footer, app);
 
     match app.mode {
-        Mode::AddBar => add_bar::render(frame, area, app),
+        Mode::AddBar => add_bar::render(
+            frame,
+            area,
+            app,
+            " Add torrent (magnet / .torrent path / URL) ",
+        ),
         Mode::Filter => filter_bar::render(frame, area, app),
+        Mode::Limits => limits_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
         Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
         Mode::SearchInput => search::render_input(frame, area, app),
         Mode::SearchResults => search::render_results(frame, area, app),
+        Mode::AddOptionsSource => add_bar::render(frame, area, app, " Add with options: source "),
+        Mode::AddOptions => add_options::render_form(frame, area, app),
+        Mode::AddOptionsFolder => {
+            add_bar::render(frame, area, app, " Output folder (blank = default) ")
+        }
+        Mode::AddOptionsFiles => add_options::render_files(frame, area, app),
         Mode::Detail { .. } | Mode::List => {}
     }
 }
@@ -123,9 +137,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ],
         vec![
             Span::styled(theme::GLYPH_DOWN, Style::new().fg(theme::ACCENT)),
-            Span::raw(format!(" {}  ", format_speed(stats.total_down))),
+            Span::raw(format!(
+                " {}{}  ",
+                format_speed(stats.total_down),
+                cap_suffix(app.down_limit)
+            )),
             Span::styled(theme::GLYPH_UP, Style::new().fg(theme::OK)),
-            Span::raw(format!(" {}", format_speed(stats.total_up))),
+            Span::raw(format!(
+                " {}{}",
+                format_speed(stats.total_up),
+                cap_suffix(app.up_limit)
+            )),
         ],
         vec![
             Span::styled("sort: ", Style::new().fg(theme::DIM)),
@@ -208,6 +230,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(line, area);
 }
 
+/// A `≤ cap` suffix for the header speed segment, empty when uncapped.
+fn cap_suffix(limit: Option<u32>) -> String {
+    match limit {
+        Some(bps) => format!(" \u{2264}{}", format_speed(bps as u64)),
+        None => String::new(),
+    }
+}
+
 /// Shorten a hex infohash to `abcd1234…ef567890`.
 fn short_hash(hash: &str) -> String {
     if hash.len() <= 17 {
@@ -228,16 +258,31 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("esc", "close"),
         ],
         Mode::Help => &[("esc/?", "close help")],
-        Mode::ConfirmRemove { .. } => &[("y", "remove"), ("n/esc", "cancel")],
+        Mode::Limits => &[("tab", "field"), ("enter", "apply"), ("esc", "cancel")],
+        Mode::ConfirmRemove { .. } => &[
+            ("f/y", "forget"),
+            ("D", "delete files"),
+            ("n/esc", "cancel"),
+        ],
+        Mode::AddOptionsSource => &[("enter", "next"), ("esc", "cancel")],
+        Mode::AddOptions => &[
+            ("p", "paused"),
+            ("o", "folder"),
+            ("f", "files"),
+            ("enter", "add"),
+            ("esc", "cancel"),
+        ],
+        Mode::AddOptionsFolder => &[("enter", "set"), ("esc", "back")],
+        Mode::AddOptionsFiles => &[("space", "toggle"), ("j/k", "move"), ("enter/esc", "back")],
         Mode::Detail { .. } => &[
             ("tab", "cycle"),
             ("j/k", "move"),
+            ("space", "file"),
             ("^d/^u", "scroll"),
             ("i/esc", "close"),
-            ("q", "quit"),
         ],
         Mode::List => &[
-            ("a", "add"),
+            ("a/A", "add"),
             ("f", "search"),
             ("j/k", "move"),
             ("i", "details"),
@@ -245,6 +290,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("r", "resume"),
             ("d", "remove"),
             ("/", "filter"),
+            ("L", "limits"),
             ("s", "sort"),
             ("?", "help"),
             ("q", "quit"),

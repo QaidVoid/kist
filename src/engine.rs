@@ -5,22 +5,26 @@
 //! on a background task, taking commands on a channel and publishing snapshots
 //! (and status messages) back to the UI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use librqbit::api::TorrentIdOrHash;
+use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, Api, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
-    TorrentStats, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, TorrentStats, TorrentStatsState,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
 use crate::config::Config;
 use crate::error;
-use crate::model::{DetailFile, DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
+use crate::model::{
+    DetailFile, DetailSnapshot, PeerRow, PreviewFile, RowState, Snapshot, TorrentRow,
+};
 use crate::search::{self, SearchOutcome};
 
 /// Owns the librqbit session and translates it into plain view models.
@@ -48,6 +52,10 @@ impl Engine {
             } else {
                 None
             },
+            ratelimits: LimitsConfig {
+                download_bps: config.download_limit_bps().and_then(NonZeroU32::new),
+                upload_bps: config.upload_limit_bps().and_then(NonZeroU32::new),
+            },
             ..Default::default()
         };
         let session = Session::new_with_opts(config.download_directory.clone(), opts)
@@ -66,6 +74,75 @@ impl Engine {
             .await
             .with_context(|| format!("failed to add torrent: {source}"))?;
         Ok(())
+    }
+
+    /// Add a torrent with explicit options: start paused, an alternate output
+    /// folder, and an explicit set of files to download.
+    pub async fn add_with_options(
+        &self,
+        source: String,
+        paused: bool,
+        output_folder: Option<String>,
+        only_files: Option<Vec<usize>>,
+    ) -> Result<()> {
+        let add = AddTorrent::from_cli_argument(&source)
+            .with_context(|| format!("invalid torrent source: {source:?}"))?;
+        let opts = AddTorrentOptions {
+            paused,
+            output_folder,
+            only_files,
+            ..Default::default()
+        };
+        self.session
+            .add_torrent(add, Some(opts))
+            .await
+            .with_context(|| format!("failed to add torrent: {source}"))?;
+        Ok(())
+    }
+
+    /// List the files of a torrent source without adding or downloading it.
+    pub async fn preview(&self, source: &str) -> Result<Vec<PreviewFile>> {
+        let add = AddTorrent::from_cli_argument(source)
+            .with_context(|| format!("invalid torrent source: {source:?}"))?;
+        let opts = AddTorrentOptions {
+            list_only: true,
+            ..Default::default()
+        };
+        let response = self
+            .session
+            .add_torrent(add, Some(opts))
+            .await
+            .with_context(|| format!("failed to read torrent: {source}"))?;
+        let AddTorrentResponse::ListOnly(list) = response else {
+            return Ok(Vec::new());
+        };
+        let mut files = Vec::new();
+        for details in list.info.iter_file_details().context("no file metadata")? {
+            files.push(PreviewFile {
+                name: details.filename.to_string().unwrap_or_default(),
+                size: details.len,
+            });
+        }
+        Ok(files)
+    }
+
+    /// Set the global download/upload rate limits live (`None` = unlimited).
+    pub fn set_limits(&self, down: Option<u32>, up: Option<u32>) {
+        self.session
+            .ratelimits
+            .set_download_bps(down.and_then(NonZeroU32::new));
+        self.session
+            .ratelimits
+            .set_upload_bps(up.and_then(NonZeroU32::new));
+    }
+
+    /// Update which files of a torrent are downloaded.
+    pub async fn set_files(&self, id: usize, included: &HashSet<usize>) -> Result<()> {
+        self.api
+            .api_torrent_action_update_only_files(TorrentIdOrHash::Id(id), included)
+            .await
+            .map(|_| ())
+            .with_context(|| format!("failed to update files for torrent {id}"))
     }
 
     /// Pause the torrent with the given id.
@@ -92,6 +169,14 @@ impl Engine {
             .delete(TorrentIdOrHash::Id(id), false)
             .await
             .with_context(|| format!("failed to remove torrent {id}"))
+    }
+
+    /// Forget the torrent with the given id and delete its downloaded files.
+    pub async fn remove_with_data(&self, id: usize) -> Result<()> {
+        self.session
+            .delete(TorrentIdOrHash::Id(id), true)
+            .await
+            .with_context(|| format!("failed to delete torrent {id}"))
     }
 
     /// Build a consistent snapshot of all torrents without performing I/O.
@@ -149,6 +234,8 @@ impl Engine {
             .ok()
             .and_then(|dump| parse_haves(&dump));
 
+        // `only_files == None` means every file is included.
+        let only_files = handle.only_files();
         let files = handle
             .with_metadata(|m| {
                 m.file_infos
@@ -158,6 +245,7 @@ impl Engine {
                         name: fi.relative_filename.to_string_lossy().to_string(),
                         size: fi.len,
                         have: file_progress.get(i).copied().unwrap_or(0).min(fi.len),
+                        included: only_files.as_ref().is_none_or(|sel| sel.contains(&i)),
                     })
                     .collect()
             })
@@ -267,6 +355,19 @@ fn mbps_to_bytes(mbps: f64) -> u64 {
 pub enum Command {
     /// Add a torrent from the given source string.
     Add(String),
+    /// Add a torrent with explicit options.
+    AddWithOptions {
+        /// Source string (magnet, path, or URL).
+        source: String,
+        /// Start the torrent paused.
+        paused: bool,
+        /// Alternate output folder, or `None` for the session default.
+        output_folder: Option<String>,
+        /// Explicit file indices to download, or `None` for all files.
+        only_files: Option<Vec<usize>>,
+    },
+    /// List a source's files without adding it, for the add-options preview.
+    PreviewAdd(String),
     /// Abort an in-flight add (e.g. a magnet stuck resolving metadata),
     /// identified by its source string.
     CancelAdd(String),
@@ -276,6 +377,22 @@ pub enum Command {
     Resume(usize),
     /// Forget a torrent by id (files are kept).
     Remove(usize),
+    /// Forget a torrent by id and delete its downloaded files.
+    RemoveWithData(usize),
+    /// Set which files of a torrent are downloaded.
+    SetFiles {
+        /// Torrent id.
+        id: usize,
+        /// File indices to keep downloading.
+        included: HashSet<usize>,
+    },
+    /// Set the global download/upload rate limits (`None` = unlimited).
+    SetLimits {
+        /// Download cap in bytes per second.
+        down: Option<u32>,
+        /// Upload cap in bytes per second.
+        up: Option<u32>,
+    },
     /// Begin publishing detail snapshots for the given torrent id.
     FetchDetail(usize),
     /// Stop publishing detail snapshots.
@@ -284,6 +401,16 @@ pub enum Command {
     Search(String),
     /// Shut the engine task down.
     Quit,
+}
+
+/// A finished add-options file preview published back to the UI.
+pub struct PreviewOutcome {
+    /// The source string the preview was requested for, for correlation.
+    pub source: String,
+    /// The listed files, empty on failure.
+    pub files: Vec<PreviewFile>,
+    /// Error message when the preview failed.
+    pub error: Option<String>,
 }
 
 /// A discrete status notification published by the engine for the UI.
@@ -309,6 +436,8 @@ pub struct EngineLink {
     pub status: mpsc::UnboundedReceiver<EngineStatus>,
     /// Search outcomes, one per [`Command::Search`].
     pub search: mpsc::UnboundedReceiver<SearchOutcome>,
+    /// Add-options file previews, one per [`Command::PreviewAdd`].
+    pub preview: mpsc::UnboundedReceiver<PreviewOutcome>,
 }
 
 /// Spawn the engine task.
@@ -324,6 +453,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     let (detail_tx, detail_rx) = watch::channel::<Option<DetailSnapshot>>(None);
     let (status_tx, status_rx) = mpsc::unbounded_channel::<EngineStatus>();
     let (search_tx, search_rx) = mpsc::unbounded_channel::<SearchOutcome>();
+    let (preview_tx, preview_rx) = mpsc::unbounded_channel::<PreviewOutcome>();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
@@ -359,12 +489,35 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                             detail_id = None;
                             let _ = detail_tx.send(None);
                         }
+                        // Setting limits is instant and live; no task needed.
+                        Command::SetLimits { down, up } => engine.set_limits(down, up),
                         // Search runs against public indexers, not the session,
                         // so it gets its own task and result channel.
                         Command::Search(query) => {
                             let search_tx = search_tx.clone();
                             tokio::spawn(async move {
                                 let _ = search_tx.send(search::search(query).await);
+                            });
+                        }
+                        // A preview resolves metadata over the network, so it
+                        // runs in its own task like search.
+                        Command::PreviewAdd(source) => {
+                            let engine = engine.clone();
+                            let preview_tx = preview_tx.clone();
+                            tokio::spawn(async move {
+                                let outcome = match engine.preview(&source).await {
+                                    Ok(files) => PreviewOutcome {
+                                        source,
+                                        files,
+                                        error: None,
+                                    },
+                                    Err(e) => PreviewOutcome {
+                                        source,
+                                        files: Vec::new(),
+                                        error: Some(error::to_status_line(&e)),
+                                    },
+                                };
+                                let _ = preview_tx.send(outcome);
                             });
                         }
                         // Adds keep an abort handle so they can be cancelled
@@ -381,6 +534,39 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                                 let _ = snapshot_tx.send(engine.snapshot());
                             });
                             add_tasks.insert(source, task.abort_handle());
+                        }
+                        // Like Add, but with explicit options; also cancellable
+                        // while metadata resolves.
+                        Command::AddWithOptions {
+                            source,
+                            paused,
+                            output_folder,
+                            only_files,
+                        } => {
+                            let engine = engine.clone();
+                            let snapshot_tx = snapshot_tx.clone();
+                            let status_tx = status_tx.clone();
+                            let key = source.clone();
+                            let task = tokio::spawn(async move {
+                                let result = engine
+                                    .add_with_options(source.clone(), paused, output_folder, only_files)
+                                    .await;
+                                let status = match result {
+                                    Ok(_) => EngineStatus {
+                                        message: "added torrent".to_string(),
+                                        is_error: false,
+                                        finished_add: Some(source),
+                                    },
+                                    Err(e) => EngineStatus {
+                                        message: error::to_status_line(&e),
+                                        is_error: true,
+                                        finished_add: Some(source),
+                                    },
+                                };
+                                let _ = status_tx.send(status);
+                                let _ = snapshot_tx.send(engine.snapshot());
+                            });
+                            add_tasks.insert(key, task.abort_handle());
                         }
                         Command::CancelAdd(source) => {
                             // A finished task means the real outcome is already
@@ -435,6 +621,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
         detail: detail_rx,
         status: status_rx,
         search: search_rx,
+        preview: preview_rx,
     }
 }
 
@@ -462,8 +649,19 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             .remove(id)
             .await
             .map(|_| format!("removed torrent {id}")),
-        // Detail, search, cancel, and quit are handled by the spawn loop, not here.
-        Command::FetchDetail(_)
+        Command::RemoveWithData(id) => engine
+            .remove_with_data(id)
+            .await
+            .map(|_| format!("deleted torrent {id} and its files")),
+        Command::SetFiles { id, included } => engine
+            .set_files(id, &included)
+            .await
+            .map(|_| format!("updated files for torrent {id}")),
+        // These are handled by the spawn loop, not here.
+        Command::AddWithOptions { .. }
+        | Command::PreviewAdd(_)
+        | Command::SetLimits { .. }
+        | Command::FetchDetail(_)
         | Command::StopDetail
         | Command::Search(_)
         | Command::CancelAdd(_)

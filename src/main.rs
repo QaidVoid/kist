@@ -47,9 +47,10 @@ fn main() -> Result<()> {
     }
 
     let refresh = config.refresh_interval();
+    let limits = (config.download_limit_bps(), config.upload_limit_bps());
     let mut terminal =
         ratatui::try_init().map_err(|e| anyhow::anyhow!("failed to initialize terminal: {e}"))?;
-    let ui_result = run_ui(&mut terminal, &mut link, refresh, initial);
+    let ui_result = run_ui(&mut terminal, &mut link, refresh, initial, limits);
     let _ = ratatui::try_restore();
     ui_result?;
 
@@ -68,9 +69,12 @@ fn run_ui(
     link: &mut EngineLink,
     refresh: Duration,
     initial: Option<String>,
+    limits: (Option<u32>, Option<u32>),
 ) -> std::io::Result<()> {
     let mut app = App::new();
     app.update_snapshot(link.snapshots.borrow().clone());
+    app.down_limit = limits.0;
+    app.up_limit = limits.1;
     if let Some(source) = &initial {
         app.push_pending_add(source);
     }
@@ -102,6 +106,11 @@ fn run_ui(
         // Drain finished searches.
         while let Ok(outcome) = link.search.try_recv() {
             app.set_search_outcome(outcome);
+        }
+
+        // Drain finished add-options previews.
+        while let Ok(outcome) = link.preview.try_recv() {
+            app.set_preview_outcome(outcome);
         }
 
         // Apply a fresh snapshot if the engine published one.

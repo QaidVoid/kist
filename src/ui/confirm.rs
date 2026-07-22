@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .saturating_add(5)
         .clamp(MIN_CONTENT_WIDTH.min(max_content), max_content);
 
-    let popup = centered_fixed(content_width as u16 + 2, 11, area);
+    let popup = centered_fixed(content_width as u16 + 2, 13, area);
     frame.render_widget(Clear, popup);
 
     let block = theme::block()
@@ -74,26 +74,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(Span::styled(stats, Style::new().fg(theme::DIM))),
         Line::raw(""),
-        Line::from(Span::styled(
-            " Files are kept on disk.",
-            Style::new().fg(theme::DIM),
-        )),
+        Line::from(vec![
+            Span::styled(
+                " f Forget ",
+                Style::new()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  keeps files", Style::new().fg(theme::DIM)),
+        ])
+        .alignment(Alignment::Center),
         Line::raw(""),
         Line::from(vec![
             Span::styled(
-                " y Remove ",
+                " D Delete ",
                 Style::new()
                     .bg(theme::ERROR)
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
-            Span::styled(
-                " n / esc Cancel ",
-                Style::new().bg(Color::DarkGray).fg(Color::White),
-            ),
+            Span::styled("  deletes files from disk", Style::new().fg(theme::ERROR)),
         ])
         .alignment(Alignment::Center),
+        Line::raw(""),
+        Line::from(Span::styled("n / esc  cancel", Style::new().fg(theme::DIM)))
+            .alignment(Alignment::Center),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(block), popup);

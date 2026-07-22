@@ -124,6 +124,8 @@ pub struct DetailFile {
     pub size: u64,
     /// Bytes confirmed downloaded.
     pub have: u64,
+    /// Whether this file is selected for download.
+    pub included: bool,
 }
 
 impl DetailFile {
@@ -135,6 +137,15 @@ impl DetailFile {
             ((self.have as f64) / (self.size as f64)).clamp(0.0, 1.0)
         }
     }
+}
+
+/// One file listed by an add-time preview, before the torrent is added.
+#[derive(Debug, Clone)]
+pub struct PreviewFile {
+    /// Path of the file relative to the download root.
+    pub name: String,
+    /// Total size in bytes.
+    pub size: u64,
 }
 
 /// One connected peer in a torrent's detail view.

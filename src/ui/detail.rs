@@ -114,7 +114,7 @@ fn tab_line(tab: DetailTab) -> Line<'static> {
 fn detail_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
     match app.detail_tab {
         DetailTab::Overview => overview_lines(d, app, width),
-        DetailTab::Files => file_lines(d, width),
+        DetailTab::Files => file_lines(d, app, width),
         DetailTab::Peers => peer_lines(d, app, width),
         DetailTab::Trackers => tracker_lines(d, width),
     }
@@ -268,19 +268,30 @@ fn sparkline(history: &std::collections::VecDeque<u64>, width: usize) -> String 
     out
 }
 
-/// Lines for the files tab: one row per file with progress, size, and path.
-fn file_lines(d: &DetailSnapshot, width: usize) -> Vec<Line<'static>> {
+/// Lines for the files tab: one row per file with an inclusion marker,
+/// progress, size, and path. The highlighted row is reverse-styled; excluded
+/// files are dimmed.
+fn file_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
     if d.files.is_empty() {
         return vec![Line::from(Span::styled(
             " (no file metadata yet)",
             Style::new().fg(theme::DIM),
         ))];
     }
-    let path_budget = width.saturating_sub(1 + 6 + 2 + 9 + 2).max(8);
+    let selected = app.detail_file_selected.min(d.files.len() - 1);
+    let path_budget = width.saturating_sub(1 + 3 + 1 + 6 + 2 + 9 + 2).max(8);
     d.files
         .iter()
-        .map(|f| {
-            Line::from(vec![
+        .enumerate()
+        .map(|(i, f)| {
+            let mark = if f.included { "[x]" } else { "[ ]" };
+            let mark_style = if f.included {
+                Style::new().fg(theme::ACCENT)
+            } else {
+                Style::new().fg(theme::DIM)
+            };
+            let mut line = Line::from(vec![
+                Span::styled(format!(" {mark}"), mark_style),
                 Span::styled(
                     format!(" {:>6}", format_percent(f.frac())),
                     Style::new().fg(theme::OK),
@@ -292,7 +303,11 @@ fn file_lines(d: &DetailSnapshot, width: usize) -> Vec<Line<'static>> {
                 ),
                 Span::raw("  "),
                 Span::raw(truncate_middle(&f.name, path_budget)),
-            ])
+            ]);
+            if i == selected && app.detail_tab == DetailTab::Files {
+                line = line.style(Style::new().add_modifier(ratatui::style::Modifier::REVERSED));
+            }
+            line
         })
         .collect()
 }

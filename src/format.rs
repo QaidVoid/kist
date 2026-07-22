@@ -122,6 +122,50 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
     format!("{}/s", format_size(bytes_per_sec))
 }
 
+/// Parse a human-readable rate into bytes per second.
+///
+/// Accepts a decimal number with an optional binary unit suffix `K`, `M`, or
+/// `G` (case-insensitive, meaning KiB, MiB, GiB); a bare number is bytes per
+/// second. An empty string or a lone `-` means unlimited and yields `None`, as
+/// does any value that cannot be parsed or is not positive.
+pub fn parse_rate(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || s == "-" {
+        return None;
+    }
+    let (num, mult) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1024.0),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1024.0 * 1024.0),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1024.0 * 1024.0 * 1024.0),
+        _ => (s, 1.0),
+    };
+    let value: f64 = num.trim().parse().ok()?;
+    if value <= 0.0 {
+        return None;
+    }
+    let bytes = (value * mult).round();
+    if bytes < 1.0 {
+        return None;
+    }
+    Some(bytes.min(u32::MAX as f64) as u32)
+}
+
+/// Format a bytes-per-second rate as a compact editable string, e.g. `2M`.
+///
+/// Uses the largest binary unit that divides the value evenly so the result
+/// round-trips through [`parse_rate`]; falls back to a bare byte count.
+pub fn format_rate(bps: u32) -> String {
+    if bps.is_multiple_of(1 << 30) {
+        format!("{}G", bps >> 30)
+    } else if bps.is_multiple_of(1 << 20) {
+        format!("{}M", bps >> 20)
+    } else if bps.is_multiple_of(1 << 10) {
+        format!("{}K", bps >> 10)
+    } else {
+        bps.to_string()
+    }
+}
+
 /// Format a fraction (clamped to `0.0..=1.0`) as a percentage, e.g. `42.1%`.
 pub fn format_percent(frac: f64) -> String {
     format!("{:.1}%", frac.clamp(0.0, 1.0) * 100.0)
@@ -162,6 +206,35 @@ mod tests {
         assert_eq!(format_percent(1.0), "100.0%");
         assert_eq!(format_percent(1.5), "100.0%");
         assert_eq!(format_percent(-0.1), "0.0%");
+    }
+
+    #[test]
+    fn parse_rate_handles_units_and_unlimited() {
+        assert_eq!(parse_rate("2M"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_rate("1.5M"), Some(1_572_864));
+        assert_eq!(parse_rate("512K"), Some(512 * 1024));
+        assert_eq!(parse_rate("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_rate("4096"), Some(4096));
+        assert_eq!(parse_rate(""), None);
+        assert_eq!(parse_rate("-"), None);
+        assert_eq!(parse_rate("fast"), None);
+        assert_eq!(parse_rate("0"), None);
+    }
+
+    #[test]
+    fn format_rate_round_trips_through_parse() {
+        for bps in [
+            2 * 1024 * 1024,
+            512 * 1024,
+            1024 * 1024 * 1024,
+            1_572_864,
+            4096,
+        ] {
+            assert_eq!(parse_rate(&format_rate(bps)), Some(bps));
+        }
+        assert_eq!(format_rate(2 * 1024 * 1024), "2M");
+        assert_eq!(format_rate(512 * 1024), "512K");
+        assert_eq!(format_rate(1_572_864), "1536K");
     }
 
     #[test]

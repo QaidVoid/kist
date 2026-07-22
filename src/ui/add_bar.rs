@@ -15,13 +15,11 @@ use crate::ui::{centered_rect, theme};
 /// cursor would leave the box (edge-scrolling), so the cursor can move freely
 /// within the visible area. Magnet links are ASCII, so one character occupies
 /// one column and char-based wrapping is sufficient.
-pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
+pub fn render(frame: &mut Frame, area: Rect, app: &mut App, title: &str) {
     let popup = centered_rect(70, 5, area);
     frame.render_widget(Clear, popup);
 
-    let block = theme::block().title(theme::title(
-        " Add torrent (magnet / .torrent path / URL) ".to_string(),
-    ));
+    let block = theme::block().title(theme::title(title.to_string()));
     let inner = block.inner(popup);
     let width = (inner.width as usize).max(1);
     let visible_rows = (inner.height as usize).max(1);
