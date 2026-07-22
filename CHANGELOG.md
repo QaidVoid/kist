@@ -1,4 +1,16 @@
 
+## [0.1.1](https://github.com/QaidVoid/kist/compare/v0.1.0...v0.1.1) - 2026-07-22
+
+### ⛰️  Features
+
+- Add rate limits, file selection, and add options - ([62614c8](https://github.com/QaidVoid/kist/commit/62614c8010671d1801e4de930cf420b8d2f75abb))
+- Show and cancel torrents resolving metadata - ([e086098](https://github.com/QaidVoid/kist/commit/e0860985240e77e1b9511958bee77e902353b7f1))
+- Add torrent search and download via public indexers - ([78c4f67](https://github.com/QaidVoid/kist/commit/78c4f67b78ae663519dbb7fbff90d741375aeace))
+
+### ⚙️ Miscellaneous Tasks
+
+- Optimize release - ([f28e285](https://github.com/QaidVoid/kist/commit/f28e285c657ec0d73c7460e72378671b311775cb))
+
 ## [0.1.0](https://github.com/QaidVoid/kist/compare/v0.0.0...v0.1.0) - 2026-07-15
 
 ### ⛰️  Features
