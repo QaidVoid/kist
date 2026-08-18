@@ -12,6 +12,7 @@ use crate::engine::{Command, EngineLink};
 use crate::error::Result;
 
 mod app;
+mod commands;
 mod config;
 mod engine;
 mod error;

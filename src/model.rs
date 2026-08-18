@@ -32,7 +32,6 @@ impl RowState {
 pub struct TorrentRow {
     pub id: usize,
     pub name: String,
-    pub infohash: String,
     pub total_bytes: u64,
     pub progress_bytes: u64,
     pub uploaded_bytes: u64,
@@ -63,11 +62,6 @@ impl TorrentRow {
         } else {
             ((self.progress_bytes as f64) / (self.total_bytes as f64)).clamp(0.0, 1.0)
         }
-    }
-
-    /// Progress as a percentage in `0.0..=100.0`.
-    pub fn progress_pct(&self) -> f64 {
-        self.progress_frac() * 100.0
     }
 }
 
@@ -208,7 +202,6 @@ pub struct WebSeedRow {
 /// data does not increase the cost of the regular list refresh.
 #[derive(Debug, Clone)]
 pub struct DetailSnapshot {
-    pub name: String,
     pub infohash: String,
     pub state: RowState,
     pub total_bytes: u64,

@@ -14,6 +14,8 @@ kist keeps things minimal: add a torrent, watch it download, and get out of your
 - Attach an arbitrary HTTP source to any torrent as a web seed (BEP 19)
 - Pause, resume, and remove torrents
 - Filter by name and sort by any column
+- Mark several torrents and pause, resume, or remove them together
+- Command palette (`:`) that finds any command by what it does
 - Adaptive layout that hides low-priority columns in narrow terminals
 
 ## Installation
@@ -59,22 +61,34 @@ Press `?` inside kist to see this list at any time.
 | `tab` | Cycle detail tab (overview, files, peers, trackers, sources) |
 | `space` | In the files tab, include / exclude the highlighted file |
 | `w` | Attach an HTTP web seed to the selected torrent |
-| `d` | In the sources tab, detach the highlighted web seed |
+| `d` | In the sources tab: detach the highlighted web seed |
 | `ctrl+d` / `ctrl+u` | Scroll detail content (also `pgdn` / `pgup`) |
 | `g` / `G` | Detail top / bottom (also `home` / `end`) |
-| `p` / `space` | Pause selected |
-| `r` | Resume selected |
+| `p` | Pause (all marked, or the selected one) |
+| `r` | Resume (all marked, or the selected one) |
+| `space` | In the list: mark / unmark for a bulk action |
+| `:` | Command palette: search every command by name |
 | `enter` | Toggle pause / resume |
-| `d` | Remove (asks to confirm) |
+| `d` | In the list: remove (asks to confirm; removes all marked) |
 | `f` / `D` | In the confirm dialog: forget (keep files) / delete with files |
 | `/` | Filter by name (blank clears) |
 | `L` | Set global rate limits (`down up`, e.g. `2M 512K`; `-` clears) |
-| `s` | Cycle sort column |
+| `s` | Cycle sort column (or pick one from `:`) |
 | `S` | Reverse sort direction |
 | `?` | Toggle help |
 | `q`, `ctrl+c` | Quit |
 
-`esc` cancels prompts and closes the detail pane.
+`esc` cancels prompts, closes the detail pane, and clears marks before it quits.
+
+## Bulk actions
+
+Press `space` to mark a torrent, and `p`, `r`, or `d` then apply to everything marked instead of just the row under the cursor. The header shows how many are marked so a bulk action never happens by surprise, and `esc` clears the marks. With nothing marked these keys behave exactly as they always have, acting on the selected torrent alone.
+
+Removing marked torrents asks first and names the count. Deleting the files from disk stays on its own `D` key rather than the default confirmation.
+
+## Command palette
+
+Press `:` to search every command by name or by what it does, including the ones with no keybinding. Typing `mirror` finds the web seed command, `sort speed` sorts by speed directly rather than cycling. Each entry shows its key, so the palette teaches the keys rather than replacing them.
 
 ## Configuration
 

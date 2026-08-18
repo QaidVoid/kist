@@ -2,7 +2,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::App;
@@ -16,11 +15,17 @@ use crate::ui::{centered_rect, theme};
 /// within the visible area. Magnet links are ASCII, so one character occupies
 /// one column and char-based wrapping is sufficient.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App, title: &str) {
-    let popup = centered_rect(70, 5, area);
+    let popup = centered_rect(70, 6, area);
     frame.render_widget(Clear, popup);
 
-    let block = theme::block().title(theme::title(title.to_string()));
+    let block = theme::overlay_block(title);
     let inner = block.inner(popup);
+    // The last interior row is the hint line, so the text area is one shorter.
+    let hint_row = inner.bottom().saturating_sub(1);
+    let inner = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
     let width = (inner.width as usize).max(1);
     let visible_rows = (inner.height as usize).max(1);
     // Remember the wrap width so Up/Down movement matches the rendered layout.
@@ -58,10 +63,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, title: &str) {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let paragraph = Paragraph::new(visible)
-        .style(Style::new().fg(theme::ACCENT))
-        .block(block);
+    let paragraph = Paragraph::new(visible).style(theme::accent()).block(block);
     frame.render_widget(paragraph, popup);
+
+    // Complain while the user types rather than after they submit.
+    let hint = match app.prompt_problem() {
+        Some(problem) => theme::validation(&problem),
+        None => theme::dismiss_hint("esc", "cancel"),
+    };
+    frame.render_widget(
+        Paragraph::new(hint),
+        Rect::new(inner.x, hint_row, inner.width, 1),
+    );
 
     // Place the terminal cursor where the next character will be typed.
     let row = cursor_line - view_top;

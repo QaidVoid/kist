@@ -1,70 +1,74 @@
-//! Help overlay.
+//! Help overlay, generated from the command table.
+//!
+//! Deriving it means a key can never be listed here and bound to something
+//! else, and a new command cannot be forgotten.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::ui::{centered_rect, theme};
+use crate::commands::{self, Group};
+use crate::ui::theme;
 
 /// Render the keybindings help popup.
 pub fn render(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(56, 26, area);
+    let mut lines: Vec<Line> = Vec::new();
+    for group in Group::all() {
+        let entries: Vec<_> = commands::in_group(group, true)
+            .into_iter()
+            .filter(|spec| spec.key.is_some())
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {}", group.label()),
+            theme::header_style(),
+        )));
+        for spec in entries {
+            let key = spec.key.unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {key:>6}  "), theme::key_style()),
+                Span::styled(spec.label.to_string(), theme::secondary()),
+            ]));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        " Press : for every command, including those with no key.",
+        theme::muted(),
+    )));
+    lines.push(theme::dismiss_hint("esc", "close"));
+
+    // Trim from the top rather than letting the bottom fall off the screen:
+    // the dismissal hint is the one line that must always survive.
+    let max_inner = area.height.saturating_sub(2) as usize;
+    while lines.len() > max_inner && lines.len() > 1 {
+        lines.remove(0);
+    }
+
+    // Sized to the content: a fixed percentage leaves labels truncated on a
+    // narrow terminal, where the room is most needed.
+    let widest = lines
+        .iter()
+        .map(|line| line.width() + 2)
+        .max()
+        .unwrap_or(20) as u16;
+    let width = widest.min(area.width.saturating_sub(2));
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = centered_fixed(width, height, area);
     frame.render_widget(Clear, popup);
-
-    let key = |k: &str| Span::styled(format!(" {:<8}", k), theme::key_style());
-    let desc = |d: &str| Span::raw(d.to_string());
-
-    let lines = vec![
-        Line::raw(""),
-        Line::from(vec![key("a"), desc("add a torrent")]),
-        Line::from(vec![
-            key("A"),
-            desc("add with options (paused/folder/files)"),
-        ]),
-        Line::from(vec![key("f"), desc("search indexers (enter downloads)")]),
-        Line::from(vec![key("j / k"), desc("move down / up")]),
-        Line::from(vec![key("i"), desc("open / close torrent details")]),
-        Line::from(vec![key("tab"), desc("cycle detail tab")]),
-        Line::from(vec![
-            key("spc"),
-            desc("in files tab: include / exclude file"),
-        ]),
-        Line::from(vec![key("w"), desc("attach an http web seed")]),
-        Line::from(vec![key("d"), desc("in sources tab: detach web seed")]),
-        Line::from(vec![
-            key("^d/^u"),
-            desc("scroll detail content (also pgdn/pgup)"),
-        ]),
-        Line::from(vec![key("p / spc"), desc("pause selected")]),
-        Line::from(vec![key("r"), desc("resume selected")]),
-        Line::from(vec![key("enter"), desc("toggle pause / resume")]),
-        Line::from(vec![
-            key("d"),
-            desc("remove (confirms) / cancel pending add"),
-        ]),
-        Line::from(vec![key("f / D"), desc("forget / delete-with-files")]),
-        Line::from(vec![key("/"), desc("filter by name (blank clears)")]),
-        Line::from(vec![key("L"), desc("set global rate limits")]),
-        Line::from(vec![key("s / S"), desc("cycle sort / reverse direction")]),
-        Line::from(vec![key("?"), desc("toggle this help")]),
-        Line::from(vec![key("q"), desc("quit")]),
-        Line::from(vec![key("ctrl+c"), desc("quit")]),
-        Line::raw(""),
-        Line::from(vec![Span::styled(
-            " esc cancels prompts and closes details",
-            Style::new().fg(theme::DIM),
-        )]),
-        Line::from(vec![Span::styled(
-            " narrow terminals hide low-priority columns",
-            Style::new().fg(theme::DIM),
-        )]),
-    ];
-
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(theme::block().title(theme::title(" kist keybindings ".to_string()))),
+        Paragraph::new(lines).block(theme::overlay_block("Keys")),
         popup,
     );
+}
+
+/// Center a fixed-size popup within `area`, clamped to the frame.
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width).max(1);
+    let height = height.min(area.height).max(1);
+    let x = area.x + (area.width - width) / 2;
+    let y = area.y + (area.height - height) / 3;
+    Rect::new(x, y, width, height)
 }

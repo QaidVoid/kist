@@ -2,7 +2,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, TableState};
 
@@ -21,11 +20,11 @@ pub fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(50, 3, area);
     frame.render_widget(Clear, popup);
 
-    let block = theme::block().title(theme::title(" Search torrents ".to_string()));
+    let block = theme::overlay_block("Search torrents");
     let inner = block.inner(popup);
 
     let paragraph = Paragraph::new(app.input.as_str())
-        .style(Style::new().fg(theme::ACCENT))
+        .style(theme::accent())
         .block(block);
     frame.render_widget(paragraph, popup);
 
@@ -49,10 +48,7 @@ pub fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     if app.search_loading {
         let lines = vec![
             Line::raw(""),
-            Line::from(Span::styled(
-                " Searching\u{2026}",
-                Style::new().fg(theme::DIM),
-            )),
+            Line::from(Span::styled(" Searching\u{2026}", theme::muted())),
         ];
         frame.render_widget(Paragraph::new(lines).block(block), popup);
         return;
@@ -91,11 +87,11 @@ pub fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from(truncate_end(&r.title, name_budget)),
                 Cell::from(Line::raw(format_size(r.size)).alignment(Alignment::Right)),
                 Cell::from(
-                    Line::styled(r.seeders.to_string(), Style::new().fg(theme::OK))
+                    Line::styled(r.seeders.to_string(), theme::success())
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(Line::raw(r.leechers.to_string()).alignment(Alignment::Right)),
-                Cell::from(Span::styled(r.source, Style::new().fg(theme::DIM))),
+                Cell::from(Span::styled(r.source, theme::muted())),
             ])
         })
         .collect();

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 
+use crate::commands::{CommandId, CommandSpec};
 use crate::engine::{Command, PreviewOutcome};
 use crate::model::{DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow};
 use crate::search::{SearchOutcome, SearchResult};
@@ -60,10 +61,13 @@ pub enum SortDir {
 
 impl SortDir {
     /// Arrow glyph for display in the chrome.
+    ///
+    /// Deliberately triangles rather than the `↑`/`↓` arrows, which mean
+    /// upload and download rates elsewhere in the same header line.
     pub fn glyph(self) -> &'static str {
         match self {
-            SortDir::Asc => "\u{2191}",
-            SortDir::Desc => "\u{2193}",
+            SortDir::Asc => "\u{25B2}",
+            SortDir::Desc => "\u{25BC}",
         }
     }
 }
@@ -132,6 +136,8 @@ pub enum Mode {
     AddOptionsFolder,
     /// The add-with-options file selection list is open.
     AddOptionsFiles,
+    /// The command palette is open.
+    Palette,
     /// The web seed URL prompt is open for the torrent with this id.
     WebSeedPrompt {
         id: usize,
@@ -209,8 +215,9 @@ impl AddOptionsState {
 }
 
 /// Which field of the limits form is focused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LimitField {
+    #[default]
     Down,
     Up,
 }
@@ -224,12 +231,6 @@ pub struct LimitsForm {
     pub up: String,
     /// Currently focused field.
     pub field: LimitField,
-}
-
-impl Default for LimitField {
-    fn default() -> Self {
-        Self::Down
-    }
 }
 
 impl LimitsForm {
@@ -304,6 +305,8 @@ pub struct App {
     pub detail_file_selected: usize,
     /// Index of the highlighted web seed in the detail Sources tab.
     pub detail_seed_selected: usize,
+    /// Index of the highlighted entry in the command palette.
+    pub palette_selected: usize,
     /// Vertical scroll offset, in lines, of the detail pane content.
     pub detail_scroll: u16,
     /// Height of the detail content viewport from the last render, used to size
@@ -329,6 +332,11 @@ pub struct App {
     pub search_loading: bool,
     /// Query the results (or in-flight search) belong to.
     pub search_query: String,
+    /// Torrent ids marked for a bulk action, independent of the cursor.
+    ///
+    /// Ids rather than row positions, so marks follow the torrent through
+    /// sorting and filtering.
+    pub marked: HashSet<usize>,
     /// Whether web seeds are enabled, so `w` can explain itself when they are not.
     pub web_seeds_enabled: bool,
     /// Active global download cap in bytes per second, if any (for display).
@@ -365,6 +373,7 @@ impl App {
             detail_tab: DetailTab::default(),
             detail_file_selected: 0,
             detail_seed_selected: 0,
+            palette_selected: 0,
             detail_scroll: 0,
             detail_page: 0,
             detail_down_history: VecDeque::new(),
@@ -377,6 +386,7 @@ impl App {
             search_selected: 0,
             search_loading: false,
             search_query: String::new(),
+            marked: HashSet::new(),
             web_seeds_enabled: true,
             down_limit: None,
             up_limit: None,
@@ -389,9 +399,236 @@ impl App {
     }
 
     /// Replace the snapshot, keeping the selection in range.
+    ///
+    /// Marks are reconciled here: a torrent that has left the session must not
+    /// leave a mark behind that would silently widen the next bulk action.
     pub fn update_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
+        if !self.marked.is_empty() {
+            let present: HashSet<usize> = self.snapshot.rows.iter().map(|r| r.id).collect();
+            self.marked.retain(|id| present.contains(id));
+        }
         self.clamp_selection();
+    }
+
+    /// Open the command palette.
+    fn run_command_palette(&mut self) -> Action {
+        self.clear_input();
+        self.palette_selected = 0;
+        self.mode = Mode::Palette;
+        Action::none()
+    }
+
+    /// Commands the palette can offer right now.
+    pub fn palette_entries(&self) -> Vec<&'static CommandSpec> {
+        crate::commands::matching(&self.input, !self.snapshot.rows.is_empty())
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Action {
+        let entries = self.palette_entries();
+        let last = entries.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                self.mode = Mode::List;
+                Action::none()
+            }
+            KeyCode::Up => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                Action::none()
+            }
+            KeyCode::Down => {
+                self.palette_selected = (self.palette_selected + 1).min(last);
+                Action::none()
+            }
+            KeyCode::Enter => match entries.get(self.palette_selected).map(|c| c.id) {
+                Some(id) => {
+                    self.clear_input();
+                    self.mode = Mode::List;
+                    self.run_command(id)
+                }
+                None => Action::none(),
+            },
+            _ => {
+                let action = self.handle_text_key(key).unwrap_or_else(Action::none);
+                // Typing narrows the list, so an old highlight may be stale.
+                self.palette_selected = 0;
+                action
+            }
+        }
+    }
+
+    /// Run a command by identity, whatever invoked it.
+    ///
+    /// Keys and the palette both land here so the two can never drift apart.
+    pub fn run_command(&mut self, id: CommandId) -> Action {
+        match id {
+            CommandId::Add => {
+                self.clear_input();
+                self.mode = Mode::AddBar;
+                Action::none()
+            }
+            CommandId::AddWithOptions => {
+                self.clear_input();
+                self.mode = Mode::AddOptionsSource;
+                Action::none()
+            }
+            CommandId::Search => {
+                self.clear_input();
+                self.mode = Mode::SearchInput;
+                Action::none()
+            }
+            CommandId::OpenDetails => match self.selected_id() {
+                Some(id) => {
+                    self.detail_tab = DetailTab::Overview;
+                    self.detail_scroll = 0;
+                    self.mode = Mode::Detail { id };
+                    Action::cmd(Command::FetchDetail(id))
+                }
+                None => Action::none(),
+            },
+            CommandId::Pause => self.bulk_command(Command::Pause),
+            CommandId::Resume => self.bulk_command(Command::Resume),
+            CommandId::Remove => self.begin_removal(),
+            CommandId::AttachWebSeed => self.open_web_seed_prompt(),
+            CommandId::Filter => {
+                self.clear_input();
+                self.mode = Mode::Filter;
+                Action::none()
+            }
+            CommandId::ClearFilter => {
+                let prev = self.selected_id();
+                self.filter = None;
+                self.reselect(prev);
+                Action::none()
+            }
+            CommandId::Limits => {
+                self.open_limits();
+                Action::none()
+            }
+            CommandId::ToggleMark => {
+                if let Some(id) = self.selected_id()
+                    && !self.marked.insert(id)
+                {
+                    self.marked.remove(&id);
+                }
+                Action::none()
+            }
+            CommandId::ClearMarks => {
+                self.marked.clear();
+                Action::none()
+            }
+            CommandId::MarkAll => {
+                let ids: Vec<usize> = self.visible_rows().iter().map(|r| r.id).collect();
+                self.marked.extend(ids);
+                Action::none()
+            }
+            CommandId::SortByName => self.set_sort(SortKey::Name),
+            CommandId::SortByState => self.set_sort(SortKey::State),
+            CommandId::SortByProgress => self.set_sort(SortKey::Progress),
+            CommandId::SortBySpeed => self.set_sort(SortKey::Speed),
+            CommandId::ReverseSort => {
+                self.cycle_sort(true);
+                Action::none()
+            }
+            CommandId::Help => {
+                self.mode = Mode::Help;
+                Action::none()
+            }
+            CommandId::Quit => Action {
+                quit: true,
+                ..Action::none()
+            },
+        }
+    }
+
+    /// Prime the rate-limits form from the active limits and open it.
+    fn open_limits(&mut self) {
+        self.limits_form = LimitsForm {
+            down: self
+                .down_limit
+                .map(crate::format::format_rate)
+                .unwrap_or_default(),
+            up: self
+                .up_limit
+                .map(crate::format::format_rate)
+                .unwrap_or_default(),
+            field: LimitField::Down,
+        };
+        self.mode = Mode::Limits;
+    }
+
+    /// Sort by an explicit key rather than by cycling to it.
+    fn set_sort(&mut self, key: SortKey) -> Action {
+        let prev = self.selected_id();
+        self.sort_key = key;
+        self.reselect(prev);
+        Action::none()
+    }
+
+    /// Apply a per-torrent command to the marked set, or to the cursor row
+    /// when nothing is marked.
+    fn bulk_command(&mut self, make: fn(usize) -> Command) -> Action {
+        let targets: Vec<usize> = match self.marked.is_empty() {
+            true => self.selected_id().into_iter().collect(),
+            false => {
+                // Act in the order shown, so status messages read sensibly.
+                self.visible_rows()
+                    .iter()
+                    .map(|r| r.id)
+                    .filter(|id| self.marked.contains(id))
+                    .collect()
+            }
+        };
+        Action {
+            commands: targets.into_iter().map(make).collect(),
+            quit: false,
+        }
+    }
+
+    /// Start a removal, confirming first.
+    fn begin_removal(&mut self) -> Action {
+        if let Some(id) = self.selected_id() {
+            self.mode = Mode::ConfirmRemove { id };
+            Action::none()
+        } else if let Some(pending) = self.selected_pending() {
+            Action::cmd(Command::CancelAdd(pending.source.clone()))
+        } else {
+            Action::none()
+        }
+    }
+
+    /// What is wrong with the current prompt input, if anything.
+    ///
+    /// Shown inside the prompt while typing, so a rejected value is caught
+    /// before the user commits to it.
+    pub fn prompt_problem(&self) -> Option<String> {
+        let text = self.input.trim();
+        if text.is_empty() {
+            return None;
+        }
+        match self.mode {
+            Mode::WebSeedPrompt { .. } => {
+                crate::webseed::validate_url(text).err().map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+
+    /// How many torrents are marked for a bulk action.
+    pub fn marked_count(&self) -> usize {
+        self.marked.len()
+    }
+
+    /// How many torrents an action aimed at `id` would actually affect.
+    ///
+    /// Marks win when any exist, so a user who never marks anything sees the
+    /// single-torrent behaviour they always had.
+    pub fn bulk_target_count(&self, id: usize) -> usize {
+        match self.marked.is_empty() {
+            true => usize::from(self.snapshot.rows.iter().any(|row| row.id == id)),
+            false => self.marked.len(),
+        }
     }
 
     /// The torrents currently shown: filtered by name and sorted by the active
@@ -554,6 +791,7 @@ impl App {
                         | Mode::AddOptionsSource
                         | Mode::AddOptionsFolder
                         | Mode::WebSeedPrompt { .. }
+                        | Mode::Palette
                 ) {
                     self.insert_str(&text);
                 }
@@ -582,11 +820,15 @@ impl App {
             Mode::AddOptionsFolder => self.handle_add_options_folder_key(key),
             Mode::AddOptionsFiles => self.handle_add_options_files_key(key),
             Mode::WebSeedPrompt { .. } => self.handle_web_seed_key(key),
+            Mode::Palette => self.handle_palette_key(key),
         }
     }
 
     fn handle_list_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
+            // esc clears a pending bulk action before it quits, so a user who
+            // marked rows and changed their mind is not thrown out of kist.
+            KeyCode::Esc if !self.marked.is_empty() => self.run_command(CommandId::ClearMarks),
             KeyCode::Char('q') | KeyCode::Esc => Action {
                 quit: true,
                 ..Action::none()
@@ -609,21 +851,7 @@ impl App {
                 self.mode = Mode::AddOptionsSource;
                 Action::none()
             }
-            KeyCode::Char('L') => {
-                self.limits_form = LimitsForm {
-                    down: self
-                        .down_limit
-                        .map(crate::format::format_rate)
-                        .unwrap_or_default(),
-                    up: self
-                        .up_limit
-                        .map(crate::format::format_rate)
-                        .unwrap_or_default(),
-                    field: LimitField::Down,
-                };
-                self.mode = Mode::Limits;
-                Action::none()
-            }
+            KeyCode::Char('L') => self.run_command(CommandId::Limits),
             KeyCode::Char('/') => {
                 if self.filter.is_some() {
                     // Toggle the filter off.
@@ -664,8 +892,10 @@ impl App {
                 self.mode = Mode::Help;
                 Action::none()
             }
-            KeyCode::Char('p') | KeyCode::Char(' ') => self.cmd_for_selected(Command::Pause),
-            KeyCode::Char('r') => self.cmd_for_selected(Command::Resume),
+            KeyCode::Char('p') => self.run_command(CommandId::Pause),
+            KeyCode::Char('r') => self.run_command(CommandId::Resume),
+            KeyCode::Char(' ') => self.run_command(CommandId::ToggleMark),
+            KeyCode::Char(':') => self.run_command_palette(),
             KeyCode::Char('d') | KeyCode::Delete => {
                 // Removal is destructive, so confirm first. Cancelling a
                 // pending add loses nothing, so it needs no confirmation.
@@ -1114,17 +1344,33 @@ impl App {
         // never the habitual key. Everything else cancels (default-cancel).
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('f') | KeyCode::Enter => {
-                self.mode = Mode::List;
-                Action::cmd(Command::Remove(id))
+                self.finish_removal(id, Command::Remove)
             }
-            KeyCode::Char('D') => {
-                self.mode = Mode::List;
-                Action::cmd(Command::RemoveWithData(id))
-            }
+            KeyCode::Char('D') => self.finish_removal(id, Command::RemoveWithData),
             _ => {
                 self.mode = Mode::List;
                 Action::none()
             }
+        }
+    }
+
+    /// Apply a confirmed removal to every marked torrent, or to `id` when
+    /// nothing is marked, then drop the marks it consumed.
+    fn finish_removal(&mut self, id: usize, make: fn(usize) -> Command) -> Action {
+        self.mode = Mode::List;
+        let targets: Vec<usize> = match self.marked.is_empty() {
+            true => vec![id],
+            false => self
+                .visible_rows()
+                .iter()
+                .map(|r| r.id)
+                .filter(|id| self.marked.contains(id))
+                .collect(),
+        };
+        self.marked.clear();
+        Action {
+            commands: targets.into_iter().map(make).collect(),
+            quit: false,
         }
     }
 
@@ -1457,13 +1703,6 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn cmd_for_selected(&self, make: fn(usize) -> Command) -> Action {
-        match self.selected_id() {
-            Some(id) => Action::cmd(make(id)),
-            None => Action::none(),
-        }
-    }
-
     fn toggle_pause_resume(&self) -> Action {
         match self.visible_rows().get(self.selected) {
             Some(row) if row.state == RowState::Paused => Action::cmd(Command::Resume(row.id)),
@@ -1623,7 +1862,6 @@ mod tests {
         TorrentRow {
             id,
             name: name.to_string(),
-            infohash: format!("h{id}"),
             total_bytes: 100,
             progress_bytes: (frac * 100.0) as u64,
             uploaded_bytes: 0,
@@ -1798,7 +2036,6 @@ mod tests {
 
     fn detail_with_files(id: usize, included: &[bool]) -> DetailSnapshot {
         DetailSnapshot {
-            name: "t".to_string(),
             infohash: format!("h{id}"),
             state: RowState::Live,
             total_bytes: 100,
@@ -2042,6 +2279,115 @@ mod tests {
             ]
         );
         assert_eq!(DetailTab::Sources.next(), DetailTab::Overview);
+    }
+
+    #[test]
+    fn bulk_actions_apply_to_marks_and_fall_back_to_the_cursor() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "alpha", RowState::Live, 0.5, 10),
+            row(1, "bravo", RowState::Live, 0.5, 10),
+            row(2, "charlie", RowState::Live, 0.5, 10),
+        ]);
+
+        // Nothing marked: the cursor row alone, exactly as before.
+        let action = a.run_command(CommandId::Pause);
+        assert!(matches!(&action.commands[..], [Command::Pause(0)]));
+
+        a.marked.insert(1);
+        a.marked.insert(2);
+        let action = a.run_command(CommandId::Pause);
+        assert_eq!(action.commands.len(), 2, "both marked torrents are paused");
+        assert!(matches!(
+            &action.commands[..],
+            [Command::Pause(1), Command::Pause(2)]
+        ));
+    }
+
+    #[test]
+    fn marks_survive_sorting_and_filtering() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "alpha", RowState::Live, 0.1, 30),
+            row(1, "bravo", RowState::Paused, 0.9, 20),
+        ]);
+        a.marked.insert(1);
+
+        a.cycle_sort(false);
+        a.cycle_sort(true);
+        assert!(a.marked.contains(&1), "sorting must not disturb marks");
+
+        a.filter = Some("alpha".to_string());
+        assert!(a.marked.contains(&1), "a hidden torrent stays marked");
+        a.filter = None;
+        assert!(a.marked.contains(&1));
+    }
+
+    #[test]
+    fn confirmed_bulk_removal_clears_marks() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "alpha", RowState::Live, 0.5, 10),
+            row(1, "bravo", RowState::Live, 0.5, 10),
+        ]);
+        a.marked.insert(0);
+        a.marked.insert(1);
+        a.mode = Mode::ConfirmRemove { id: 0 };
+
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        assert_eq!(action.commands.len(), 2, "both marked torrents removed");
+        assert_eq!(a.marked_count(), 0, "marks are consumed by the removal");
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn escape_clears_marks_before_it_quits() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(0, "alpha", RowState::Live, 0.5, 10)]);
+
+        a.marked.insert(0);
+        let action = a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!action.quit, "esc with marks must not quit");
+        assert_eq!(a.marked_count(), 0);
+
+        // With nothing marked it keeps its old meaning.
+        let action = a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(action.quit, "esc still quits when nothing is marked");
+    }
+
+    #[test]
+    fn space_marks_and_unmarks_the_cursor_row() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(7, "alpha", RowState::Live, 0.5, 10)]);
+        a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(a.marked.contains(&7));
+        a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(a.marked.is_empty(), "space toggles rather than only adding");
+    }
+
+    #[test]
+    fn the_palette_runs_the_same_commands_as_the_keys() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(0, "alpha", RowState::Live, 0.5, 10)]);
+
+        a.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        assert_eq!(a.mode, Mode::Palette);
+        type_str(&mut a, "pause");
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&action.commands[..], [Command::Pause(0)]));
+        assert_eq!(a.mode, Mode::List, "the palette closes after running");
+    }
+
+    #[test]
+    fn the_palette_can_sort_without_cycling() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(0, "alpha", RowState::Live, 0.5, 10)]);
+        a.sort_key = SortKey::Name;
+
+        a.handle_key(KeyEvent::from(KeyCode::Char(':')));
+        type_str(&mut a, "sort speed");
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.sort_key, SortKey::Speed);
     }
 
     #[test]

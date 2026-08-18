@@ -2,7 +2,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::App;
@@ -13,13 +12,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(50, 3, area);
     frame.render_widget(Clear, popup);
 
-    let block = theme::block().title(theme::title(
-        " Filter (substring, blank to clear) ".to_string(),
-    ));
+    let block = theme::overlay_block("Filter by name");
     let inner = block.inner(popup);
 
     let paragraph = Paragraph::new(app.input.as_str())
-        .style(Style::new().fg(theme::WARN))
+        .style(theme::warning())
         .block(block);
     frame.render_widget(paragraph, popup);
 

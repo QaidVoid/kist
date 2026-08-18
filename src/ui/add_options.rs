@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
@@ -17,7 +17,7 @@ pub fn render_form(frame: &mut Frame, area: Rect, app: &App) {
     };
     let popup = centered_rect(70, 11, area);
     frame.render_widget(Clear, popup);
-    let block = theme::block().title(theme::title(" Add with options ".to_string()));
+    let block = theme::overlay_block("Add with options");
     let inner = block.inner(popup);
     let budget = inner.width.saturating_sub(2) as usize;
 
@@ -39,7 +39,7 @@ pub fn render_form(frame: &mut Frame, area: Rect, app: &App) {
     let field = |k: &str, label: &str, value: String| {
         Line::from(vec![
             Span::styled(format!(" {k}  "), theme::key_style()),
-            Span::styled(format!("{label:<8}"), Style::new().fg(theme::WARN)),
+            Span::styled(format!("{label:<8}"), theme::warning()),
             Span::raw(value),
         ])
     };
@@ -48,7 +48,7 @@ pub fn render_form(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(vec![
             Span::raw(" "),
-            Span::styled("source  ", Style::new().fg(theme::DIM)),
+            Span::styled("source  ", theme::muted()),
             Span::raw(truncate_end(&state.source, budget.saturating_sub(9))),
         ]),
         Line::raw(""),
@@ -67,7 +67,7 @@ pub fn render_files(frame: &mut Frame, area: Rect, app: &App) {
     };
     let popup = centered_rect(76, 20, area);
     frame.render_widget(Clear, popup);
-    let block = theme::block().title(theme::title(" Select files (space toggles) ".to_string()));
+    let block = theme::overlay_block("Select files");
     let inner = block.inner(popup);
     let rows = inner.height as usize;
     let budget = inner.width.saturating_sub(1) as usize;
@@ -90,9 +90,9 @@ pub fn render_files(frame: &mut Frame, area: Rect, app: &App) {
                 truncate_middle(&f.name, name_budget)
             );
             let mut style = if f.included {
-                Style::new().fg(theme::OK)
+                theme::success()
             } else {
-                Style::new().fg(theme::DIM)
+                theme::muted()
             };
             if i == state.file_selected {
                 style = style.add_modifier(Modifier::REVERSED);

@@ -6,9 +6,8 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, Mode};
 use crate::format::{display_width, format_speed, truncate_end};
@@ -19,14 +18,49 @@ pub mod add_options;
 pub mod confirm;
 pub mod detail;
 pub mod filter_bar;
+#[cfg(test)]
+pub mod harness;
 pub mod help;
+#[cfg(test)]
+mod layout_tests;
 pub mod limits_bar;
 pub mod list;
+pub mod palette;
 pub mod search;
 pub mod theme;
 
 /// Smallest terminal the normal layout supports (columns, rows).
-const MIN_SIZE: (u16, u16) = (40, 10);
+pub(crate) const MIN_SIZE: (u16, u16) = (40, 10);
+
+/// How much horizontal room the UI has to work with.
+///
+/// Every region that rearranges on width resolves it here, so a resize moves
+/// them all on the same render instead of each module picking its own cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Width {
+    /// Room for one column of content and little else.
+    Compact,
+    /// The ordinary case: the full table, single-column detail.
+    Medium,
+    /// Enough room to lay content out side by side.
+    Wide,
+}
+
+/// Narrowest terminal considered [`Width::Medium`].
+pub const BREAKPOINT_MEDIUM: u16 = 72;
+/// Narrowest terminal considered [`Width::Wide`].
+pub const BREAKPOINT_WIDE: u16 = 100;
+
+impl Width {
+    /// Classify a terminal width.
+    pub fn of(width: u16) -> Self {
+        match width {
+            w if w >= BREAKPOINT_WIDE => Width::Wide,
+            w if w >= BREAKPOINT_MEDIUM => Width::Medium,
+            _ => Width::Compact,
+        }
+    }
+}
 
 /// Fraction of the main area given to the list when the detail pane is open.
 const DETAIL_LIST_PERCENT: u16 = 40;
@@ -41,13 +75,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let [header, main, status, footer] = Layout::vertical([
-        Constraint::Length(3),
+    let [header, main, status] = Layout::vertical([
+        Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(1),
-        Constraint::Length(1),
     ])
-    .areas::<4>(area);
+    .areas::<3>(area);
 
     render_header(frame, header, app);
     if app.detail_target_id().is_some() {
@@ -62,30 +95,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         list::render(frame, main, app);
     }
     render_status(frame, status, app);
-    render_footer(frame, footer, app);
 
     match app.mode {
-        Mode::AddBar => add_bar::render(
-            frame,
-            area,
-            app,
-            " Add torrent (magnet / .torrent path / URL) ",
-        ),
+        Mode::AddBar => add_bar::render(frame, area, app, "Add torrent"),
         Mode::Filter => filter_bar::render(frame, area, app),
         Mode::Limits => limits_bar::render(frame, area, app),
         Mode::Help => help::render(frame, area),
         Mode::ConfirmRemove { .. } => confirm::render(frame, area, app),
         Mode::SearchInput => search::render_input(frame, area, app),
         Mode::SearchResults => search::render_results(frame, area, app),
-        Mode::AddOptionsSource => add_bar::render(frame, area, app, " Add with options: source "),
+        Mode::AddOptionsSource => add_bar::render(frame, area, app, "Add with options"),
         Mode::AddOptions => add_options::render_form(frame, area, app),
-        Mode::AddOptionsFolder => {
-            add_bar::render(frame, area, app, " Output folder (blank = default) ")
-        }
+        Mode::AddOptionsFolder => add_bar::render(frame, area, app, "Output folder"),
         Mode::AddOptionsFiles => add_options::render_files(frame, area, app),
-        Mode::WebSeedPrompt { .. } => {
-            add_bar::render(frame, area, app, " Add web seed (http/https URL) ")
-        }
+        Mode::WebSeedPrompt { .. } => add_bar::render(frame, area, app, "Add web seed"),
+        Mode::Palette => palette::render(frame, area, app),
         Mode::Detail { .. } | Mode::List => {}
     }
 }
@@ -106,68 +130,88 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// Draw the header: one line of summary plus a separating rule.
+///
+/// Counts and transfer rates are kept apart and never share a glyph. The state
+/// arrows belong to the rows, so here the counts are spelled out and the arrows
+/// mean only "download rate" and "upload rate".
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let stats = &app.snapshot.aggregate;
+    let rule = Block::new()
+        .borders(Borders::BOTTOM)
+        .border_style(theme::muted());
+    let line_area = rule.inner(area);
+    frame.render_widget(rule, area);
 
-    // Segments in display order; trailing segments are dropped when the
-    // terminal is too narrow rather than letting the line wrap.
+    // Segments in priority order; trailing ones are dropped when the terminal
+    // is too narrow rather than letting the line wrap.
     let mut segments: Vec<Vec<Span>> = vec![
-        vec![Span::raw(" "), theme::title("kist".to_string())],
+        vec![theme::title("kist".to_string())],
+        vec![Span::styled(
+            format!(
+                "{} torrent{}",
+                stats.count,
+                if stats.count == 1 { "" } else { "s" }
+            ),
+            theme::secondary(),
+        )],
         vec![
+            Span::styled(theme::GLYPH_DOWN, theme::accent()),
             Span::styled(
                 format!(
-                    "{} torrent{}  ",
-                    stats.count,
-                    if stats.count == 1 { "" } else { "s" }
+                    " {}{}  ",
+                    format_speed(stats.total_down),
+                    cap_suffix(app.down_limit)
                 ),
-                Style::new().fg(theme::DIM),
+                theme::secondary(),
             ),
+            Span::styled(theme::GLYPH_UP, theme::success()),
             Span::styled(
-                theme::state_glyph(RowState::Live, false),
-                Style::new().fg(theme::ACCENT),
+                format!(
+                    " {}{}",
+                    format_speed(stats.total_up),
+                    cap_suffix(app.up_limit)
+                ),
+                theme::secondary(),
             ),
-            Span::raw(format!(" {}  ", stats.downloading)),
-            Span::styled(
-                theme::state_glyph(RowState::Live, true),
-                Style::new().fg(theme::OK),
-            ),
-            Span::raw(format!(" {}  ", stats.seeding)),
-            Span::styled(
-                theme::state_glyph(RowState::Paused, false),
-                Style::new().fg(theme::DIM),
-            ),
-            Span::raw(format!(" {}", stats.paused)),
-        ],
-        vec![
-            Span::styled(theme::GLYPH_DOWN, Style::new().fg(theme::ACCENT)),
-            Span::raw(format!(
-                " {}{}  ",
-                format_speed(stats.total_down),
-                cap_suffix(app.down_limit)
-            )),
-            Span::styled(theme::GLYPH_UP, Style::new().fg(theme::OK)),
-            Span::raw(format!(
-                " {}{}",
-                format_speed(stats.total_up),
-                cap_suffix(app.up_limit)
-            )),
-        ],
-        vec![
-            Span::styled("sort: ", Style::new().fg(theme::DIM)),
-            Span::raw(format!("{} {}", app.sort_key.label(), app.sort_dir.glyph())),
         ],
     ];
-    if let Some(filter) = &app.filter {
-        segments.push(vec![
-            Span::styled("filter: ", Style::new().fg(theme::DIM)),
-            Span::styled(filter.clone(), Style::new().fg(theme::WARN)),
-        ]);
-    }
 
-    let budget = area.width.saturating_sub(2) as usize;
+    // A filter or a pending bulk action changes what every other number means,
+    // so they outrank the per-state breakdown when room is short.
+    if let Some(filter) = &app.filter {
+        segments.insert(
+            2,
+            vec![
+                Span::styled("filter ", theme::muted()),
+                Span::styled(filter.clone(), theme::warning()),
+            ],
+        );
+    }
+    if app.marked_count() > 0 {
+        segments.insert(
+            2,
+            vec![Span::styled(
+                format!("{} marked", app.marked_count()),
+                theme::marked_style(),
+            )],
+        );
+    }
+    if let Some(counts) = state_counts(stats) {
+        segments.push(vec![Span::styled(counts, theme::muted())]);
+    }
+    segments.push(vec![
+        Span::styled("sort ", theme::muted()),
+        Span::styled(
+            format!("{} {}", app.sort_key.label(), app.sort_dir.glyph()),
+            theme::secondary(),
+        ),
+    ]);
+
+    let budget = line_area.width.saturating_sub(2) as usize;
     let separator = "   ";
-    let mut spans: Vec<Span> = Vec::new();
-    let mut used = 0;
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1;
     for (i, segment) in segments.into_iter().enumerate() {
         let seg_width: usize = segment.iter().map(|s| display_width(&s.content)).sum();
         let sep_width = if i == 0 { 0 } else { separator.len() };
@@ -181,56 +225,117 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         used += sep_width + seg_width;
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(theme::block()),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
 }
 
+/// Spell out the non-zero per-state counts, or `None` when there is nothing to
+/// say. Words rather than glyphs, so counts cannot be misread as rates.
+fn state_counts(stats: &crate::model::AggregateStats) -> Option<String> {
+    let parts: Vec<String> = [
+        (stats.downloading, "downloading"),
+        (stats.seeding, "seeding"),
+        (stats.paused, "paused"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| format!("{n} {label}"))
+    .collect();
+    match parts.is_empty() {
+        true => None,
+        false => Some(parts.join(", ")),
+    }
+}
+
+/// Draw the one bottom row.
+///
+/// It carries whatever is most worth saying right now, in priority order: a
+/// transient message, then a problem with the selected torrent, then the
+/// selected torrent's full name when the list truncated it, and otherwise the
+/// key hints. The name matters because the Name column truncates, so this is
+/// the only place a long name can be read in full.
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let budget = area.width.saturating_sub(1) as usize;
-    let line = if let Some(message) = &app.status {
-        let style = if app.status_is_error {
-            Style::new().fg(theme::ERROR)
-        } else {
-            Style::new().fg(theme::OK)
+
+    // While an overlay is open its own keys are the only ones that apply, so
+    // the row belongs to it rather than to whatever is selected behind it.
+    if !matches!(app.mode, Mode::List | Mode::Detail { .. }) {
+        render_hints(frame, area, app);
+        return;
+    }
+
+    if let Some(message) = &app.status {
+        let style = match app.status_is_error {
+            true => theme::danger(),
+            false => theme::success(),
         };
-        Line::from(Span::styled(
+        let line = Line::from(Span::styled(
             format!(" {}", truncate_end(message, budget)),
             style,
-        ))
-    } else {
-        match app.visible_rows().get(app.selected).copied() {
-            Some(row) if row.state == RowState::Error => {
-                let msg = row
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "torrent error".to_string());
-                Line::from(Span::styled(
-                    format!(" {}", truncate_end(&msg, budget)),
-                    Style::new().fg(theme::ERROR),
-                ))
-            }
-            Some(row) => {
-                let hash = short_hash(&row.infohash);
-                let name_budget = budget.saturating_sub(hash.len() + 2);
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(hash, Style::new().fg(theme::DIM)),
-                    Span::raw(format!("  {}", truncate_end(&row.name, name_budget))),
-                ])
-            }
-            // A selected pending add: show what was dispatched.
-            None => match app.selected_pending() {
-                Some(pending) => Line::from(Span::styled(
-                    format!(" {}", truncate_end(&pending.source, budget)),
-                    Style::new().fg(theme::DIM),
-                )),
-                None => Line::raw(" "),
-            },
-        }
-    };
-    frame.render_widget(line, area);
+        ));
+        frame.render_widget(line, area);
+        return;
+    }
+
+    let selected = app.visible_rows().get(app.selected).copied();
+    if let Some(row) = selected
+        && row.state == RowState::Error
+    {
+        let message = row
+            .error
+            .clone()
+            .unwrap_or_else(|| "torrent error".to_string());
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", theme::state_glyph(row.state, false)),
+                theme::danger(),
+            ),
+            Span::styled(
+                truncate_end(&message, budget.saturating_sub(3)),
+                theme::danger(),
+            ),
+        ]);
+        frame.render_widget(line, area);
+        return;
+    }
+
+    // A pending add has no row yet, so show what was dispatched.
+    if selected.is_none()
+        && let Some(pending) = app.selected_pending()
+    {
+        let line = Line::from(Span::styled(
+            format!(" {}", truncate_end(&pending.source, budget)),
+            theme::muted(),
+        ));
+        frame.render_widget(line, area);
+        return;
+    }
+
+    // Reading the whole name beats reading the hints, but help must stay
+    // reachable, so it is pinned to the right rather than dropped.
+    if let Some(row) = selected
+        && display_width(&row.name) > list::name_budget(area.width)
+    {
+        const PINNED: &str = "? help  q quit";
+        let name_budget = budget.saturating_sub(PINNED.len() + 3);
+        let name = truncate_end(&row.name, name_budget);
+        let pad = budget
+            .saturating_sub(display_width(&name) + PINNED.len() + 1)
+            .max(1);
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled(format!(" {name}"), theme::secondary()),
+                Span::raw(" ".repeat(pad)),
+                Span::styled("?", theme::key_style()),
+                Span::styled(" help  ", theme::muted()),
+                Span::styled("q", theme::key_style()),
+                Span::styled(" quit", theme::muted()),
+            ]),
+            area,
+        );
+        return;
+    }
+
+    render_hints(frame, area, app);
 }
 
 /// A `≤ cap` suffix for the header speed segment, empty when uncapped.
@@ -241,15 +346,8 @@ fn cap_suffix(limit: Option<u32>) -> String {
     }
 }
 
-/// Shorten a hex infohash to `abcd1234…ef567890`.
-fn short_hash(hash: &str) -> String {
-    if hash.len() <= 17 {
-        return hash.to_string();
-    }
-    format!("{}\u{2026}{}", &hash[..8], &hash[hash.len() - 8..])
-}
-
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+/// Draw the key hints for the current mode.
+fn render_hints(frame: &mut Frame, area: Rect, app: &App) {
     let hints: &[(&str, &str)] = match app.mode {
         Mode::AddBar => &[("enter", "add"), ("esc", "cancel")],
         Mode::Filter => &[("enter", "apply"), ("esc", "cancel"), ("blank", "clears")],
@@ -278,6 +376,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::AddOptionsFolder => &[("enter", "set"), ("esc", "back")],
         Mode::AddOptionsFiles => &[("space", "toggle"), ("j/k", "move"), ("enter/esc", "back")],
         Mode::WebSeedPrompt { .. } => &[("enter", "attach"), ("esc", "cancel")],
+        Mode::Palette => &[("enter", "run"), ("up/down", "move"), ("esc", "cancel")],
         Mode::Detail { .. } if app.detail_tab == crate::app::DetailTab::Sources => &[
             ("tab", "cycle"),
             ("j/k", "move"),
@@ -293,43 +392,69 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("^d/^u", "scroll"),
             ("i/esc", "close"),
         ],
-        Mode::List => &[
-            ("a/A", "add"),
-            ("f", "search"),
-            ("j/k", "move"),
-            ("i", "details"),
-            ("p", "pause"),
-            ("r", "resume"),
-            ("d", "remove"),
-            ("w", "web seed"),
-            ("/", "filter"),
-            ("L", "limits"),
-            ("s", "sort"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
+        // Generated from the command table so the footer cannot drift from
+        // what the keys actually do.
+        Mode::List => &list_hints(app),
     };
 
+    // Reserve room for the "more exist" indicator so truncation is never
+    // silent: dropping hints without saying so is how a user ends up unable to
+    // find help or quit.
     let budget = area.width.saturating_sub(1) as usize;
+    let indicator_width = display_width(theme::GLYPH_MORE) + 2;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     let mut used = 1;
+    let mut shown = 0;
     for (i, (key, label)) in hints.iter().enumerate() {
         let sep = if i == 0 { 0 } else { 2 };
         let width = key.len() + 1 + label.len();
-        if used + sep + width > budget {
+        // Every hint but the last must leave room for the indicator.
+        let reserve = if i + 1 == hints.len() {
+            0
+        } else {
+            indicator_width
+        };
+        if used + sep + width + reserve > budget {
             break;
         }
         if i > 0 {
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(key.to_string(), theme::key_style()));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::new().fg(theme::DIM),
-        ));
+        spans.push(Span::styled(format!(" {label}"), theme::muted()));
         used += sep + width;
+        shown += 1;
+    }
+    if shown < hints.len() {
+        spans.push(Span::styled(
+            format!("  {}", theme::GLYPH_MORE),
+            theme::muted(),
+        ));
     }
     frame.render_widget(Line::from(spans), area);
+}
+
+/// Footer hints for list mode, essentials first.
+///
+/// Movement is not a command in the table, so it is prepended here; everything
+/// else comes from the table, ordered so the essential hints survive
+/// truncation on a narrow terminal.
+fn list_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let has_torrent = !app.snapshot.rows.is_empty();
+    let mut hints = vec![("j/k", "move")];
+    let mut rest = Vec::new();
+    for spec in crate::commands::COMMANDS {
+        let Some(key) = spec.key else { continue };
+        if spec.needs_torrent && !has_torrent {
+            continue;
+        }
+        match spec.essential {
+            true => hints.push((key, spec.short)),
+            false => rest.push((key, spec.short)),
+        }
+    }
+    hints.extend(rest);
+    hints
 }
 
 /// Center a popup of `percent_x`% width and `height` rows within `area`,

@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
@@ -32,16 +32,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
 
-    let title_name = app
-        .detail
-        .as_ref()
-        .map(|d| d.name.clone())
-        .unwrap_or_else(|| format!("torrent {id}"));
-    let title_budget = (area.width as usize).saturating_sub(14);
-    let block = theme::block().title(theme::title(format!(
-        " Details: {} ",
-        truncate_end(&title_name, title_budget)
-    )));
+    // No title: the list row and status line already name this torrent, and
+    // repeating it spends a border row on information already on screen.
+    let _ = id;
+    let block = theme::block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -49,29 +43,38 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas::<2>(inner);
     frame.render_widget(Paragraph::new(tab_line(app.detail_tab)), tab_area);
 
-    // Reserve the rightmost column for the scrollbar.
-    let text_area = Rect {
-        width: body_area.width.saturating_sub(1),
-        ..body_area
-    };
-    let width = text_area.width as usize;
-
+    // Lay out for the full width first; the scrollbar column is only taken
+    // back if the content turns out not to fit.
     let lines = match app.detail.as_ref() {
-        Some(d) => detail_lines(d, app, width),
-        None => vec![Line::raw(" (no data yet)")],
+        Some(d) => detail_lines(d, app, body_area.width as usize),
+        None => vec![Line::styled(" (no data yet)", theme::muted())],
+    };
+    let overflows = lines.len() > body_area.height as usize;
+    let text_area = match overflows {
+        true => Rect {
+            width: body_area.width.saturating_sub(1),
+            ..body_area
+        },
+        false => body_area,
+    };
+    let lines = match overflows {
+        true => match app.detail.as_ref() {
+            Some(d) => detail_lines(d, app, text_area.width as usize),
+            None => lines,
+        },
+        false => lines,
     };
 
     app.detail_page = body_area.height.max(1);
     let max_scroll = (lines.len() as u16).saturating_sub(body_area.height);
     app.detail_scroll = app.detail_scroll.min(max_scroll);
 
-    let total = lines.len();
     frame.render_widget(
         Paragraph::new(lines).scroll((app.detail_scroll, 0)),
         text_area,
     );
 
-    if total > body_area.height as usize {
+    if overflows {
         let mut sb_state =
             ScrollbarState::new(max_scroll as usize).position(app.detail_scroll as usize);
         frame.render_stateful_widget(
@@ -97,15 +100,15 @@ fn tab_line(tab: DetailTab) -> Line<'static> {
             spans.push(Span::raw(" "));
         }
         let label = format!(" {} ", t.label());
+        // The active tab is marked by weight and colour rather than a filled
+        // block, which shouted louder than the content beneath it.
         if t == tab {
             spans.push(Span::styled(
                 label,
-                Style::new()
-                    .fg(ratatui::style::Color::Black)
-                    .bg(theme::ACCENT),
+                theme::accent().add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.push(Span::styled(label, Style::new().fg(theme::DIM)));
+            spans.push(Span::styled(label, theme::muted()));
         }
     }
     Line::from(spans)
@@ -128,8 +131,8 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
     } else {
         d.progress_bytes as f64 / d.total_bytes as f64
     };
-    let mut lines = vec![
-        kv_line(
+    let fields: Vec<(&str, String)> = vec![
+        (
             "State",
             format!(
                 "{} {}",
@@ -137,7 +140,7 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
                 theme::state_label(d.state, d.finished)
             ),
         ),
-        kv_line(
+        (
             "Progress",
             format!(
                 "{}  ({} / {})",
@@ -146,14 +149,7 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
                 format_size(d.total_bytes)
             ),
         ),
-        kv_line(
-            "ETA",
-            match d.eta {
-                Some(eta) => format_duration(eta),
-                None => theme::NONE.to_string(),
-            },
-        ),
-        kv_line(
+        (
             "Speed",
             format!(
                 "{} {}  {} {}",
@@ -163,7 +159,14 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
                 format_speed(d.up_speed)
             ),
         ),
-        kv_line(
+        (
+            "ETA",
+            match d.eta {
+                Some(eta) => format_duration(eta),
+                None => theme::NONE.to_string(),
+            },
+        ),
+        (
             "Uploaded",
             format!(
                 "{}  ratio {}",
@@ -171,9 +174,32 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
                 format_ratio(d.ratio())
             ),
         ),
-        kv_line("Peers", d.peers.to_string()),
-        kv_line("Info hash", d.infohash.clone()),
+        ("Peers", d.peers.to_string()),
     ];
+
+    // Pair the fields up when there is room, which roughly halves the vertical
+    // space the Overview spends and stops the pane looking mostly empty.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if crate::ui::Width::of(width as u16) >= crate::ui::Width::Medium {
+        let half = width / 2;
+        for pair in fields.chunks(2) {
+            let mut spans = kv_spans(pair[0].0, pair[0].1.clone(), half.saturating_sub(1));
+            if let Some((key, value)) = pair.get(1) {
+                let used: usize = spans
+                    .iter()
+                    .map(|s| crate::format::display_width(&s.content))
+                    .sum();
+                spans.push(Span::raw(" ".repeat(half.saturating_sub(used).max(1))));
+                spans.extend(kv_spans(key, value.clone(), half.saturating_sub(1)));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        for (key, value) in &fields {
+            lines.push(Line::from(kv_spans(key, value.clone(), width)));
+        }
+    }
+    lines.push(Line::from(kv_spans("Info hash", d.infohash.clone(), width)));
 
     let value_width = width.saturating_sub(KEY_WIDTH + 2);
     if let Some(pieces) = &d.pieces
@@ -182,36 +208,31 @@ fn overview_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
     {
         let have = pieces.iter().filter(|b| **b).count();
         lines.push(Line::raw(""));
-        lines.push(kv_line("Pieces", format!("{have} / {}", pieces.len())));
+        lines.push(Line::from(kv_spans(
+            "Pieces",
+            format!("{have} / {}", pieces.len()),
+            width,
+        )));
         lines.push(Line::from(vec![
             Span::raw(format!(" {:<KEY_WIDTH$} ", "")),
-            Span::styled(
-                piece_map(pieces, value_width),
-                Style::new().fg(theme::ACCENT),
-            ),
+            Span::styled(piece_map(pieces, value_width), theme::accent()),
         ]));
     }
 
     if value_width >= 8 {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:<KEY_WIDTH$} ", "Down"),
-                Style::new().fg(theme::WARN),
-            ),
+            Span::styled(format!(" {:<KEY_WIDTH$} ", "Down"), theme::warning()),
             Span::styled(
                 sparkline(&app.detail_down_history, value_width),
-                Style::new().fg(theme::ACCENT),
+                theme::accent(),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:<KEY_WIDTH$} ", "Up"),
-                Style::new().fg(theme::WARN),
-            ),
+            Span::styled(format!(" {:<KEY_WIDTH$} ", "Up"), theme::warning()),
             Span::styled(
                 sparkline(&app.detail_up_history, value_width),
-                Style::new().fg(theme::OK),
+                theme::success(),
             ),
         ]));
     }
@@ -277,7 +298,7 @@ fn file_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
     if d.files.is_empty() {
         return vec![Line::from(Span::styled(
             " (no file metadata yet)",
-            Style::new().fg(theme::DIM),
+            theme::muted(),
         ))];
     }
     let selected = app.detail_file_selected.min(d.files.len() - 1);
@@ -288,21 +309,18 @@ fn file_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
         .map(|(i, f)| {
             let mark = if f.included { "[x]" } else { "[ ]" };
             let mark_style = if f.included {
-                Style::new().fg(theme::ACCENT)
+                theme::accent()
             } else {
-                Style::new().fg(theme::DIM)
+                theme::muted()
             };
             let mut line = Line::from(vec![
                 Span::styled(format!(" {mark}"), mark_style),
                 Span::styled(
                     format!(" {:>6}", format_percent(f.frac())),
-                    Style::new().fg(theme::OK),
+                    theme::success(),
                 ),
                 Span::raw("  "),
-                Span::styled(
-                    format!("{:>9}", format_size(f.size)),
-                    Style::new().fg(theme::DIM),
-                ),
+                Span::styled(format!("{:>9}", format_size(f.size)), theme::muted()),
                 Span::raw("  "),
                 Span::raw(truncate_middle(&f.name, path_budget)),
             ]);
@@ -319,7 +337,7 @@ fn peer_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
     if d.peer_rows.is_empty() {
         return vec![Line::from(Span::styled(
             " No peers connected.",
-            Style::new().fg(theme::DIM),
+            theme::muted(),
         ))];
     }
     let addr_budget = width
@@ -351,7 +369,7 @@ fn peer_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
             speed
         ));
         match p.web_seed {
-            true => line.style(Style::new().fg(theme::WARN)),
+            true => line.style(theme::warning()),
             false => line,
         }
     }));
@@ -363,7 +381,7 @@ fn tracker_lines(d: &DetailSnapshot, width: usize) -> Vec<Line<'static>> {
     if d.trackers.is_empty() {
         return vec![Line::from(Span::styled(
             " No trackers (DHT/PEX only).",
-            Style::new().fg(theme::DIM),
+            theme::muted(),
         ))];
     }
     d.trackers
@@ -378,7 +396,7 @@ fn web_seed_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
     if d.web_seeds.is_empty() {
         return vec![Line::from(Span::styled(
             " No web seeds. Press w to attach an HTTP source.",
-            Style::new().fg(theme::DIM),
+            theme::muted(),
         ))];
     }
     let selected = app.detail_seed_selected.min(d.web_seeds.len() - 1);
@@ -394,7 +412,7 @@ fn web_seed_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
             Span::raw("  "),
             Span::styled(
                 format!("{:>9}", format_size(seed.served_bytes)),
-                Style::new().fg(theme::DIM),
+                theme::muted(),
             ),
             Span::raw("  "),
             Span::raw(truncate_middle(&seed.url, url_budget)),
@@ -406,7 +424,7 @@ fn web_seed_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
         if let Some(error) = &seed.error {
             lines.push(Line::from(Span::styled(
                 format!("   {}", truncate_end(error, width.saturating_sub(3))),
-                Style::new().fg(theme::ERROR),
+                theme::danger(),
             )));
         }
     }
@@ -417,19 +435,17 @@ fn web_seed_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'stat
 fn seed_color(state: WebSeedState) -> ratatui::style::Color {
     match state {
         WebSeedState::Active => theme::OK,
-        WebSeedState::Idle | WebSeedState::Connecting => theme::DIM,
+        WebSeedState::Idle | WebSeedState::Connecting => theme::TEXT_MUTED,
         WebSeedState::BackingOff => theme::WARN,
         WebSeedState::Failed => theme::ERROR,
     }
 }
 
-/// A labelled key/value line with a themed key and a plain value.
-fn kv_line(key: &str, value: String) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!(" {:<KEY_WIDTH$} ", key),
-            Style::new().fg(theme::WARN),
-        ),
-        Span::raw(value),
-    ])
+/// A labelled key/value pair: muted label, secondary value, truncated to fit.
+fn kv_spans(key: &str, value: String, width: usize) -> Vec<Span<'static>> {
+    let value_budget = width.saturating_sub(KEY_WIDTH + 2);
+    vec![
+        Span::styled(format!(" {key:<KEY_WIDTH$} "), theme::muted()),
+        Span::styled(truncate_end(&value, value_budget), theme::secondary()),
+    ]
 }

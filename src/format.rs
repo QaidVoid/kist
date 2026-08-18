@@ -94,13 +94,46 @@ pub fn format_duration(d: Duration) -> String {
     } else if secs < 86_400 {
         format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     } else {
-        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+        // A stalled torrent can produce an absurd estimate, so cap the days
+        // rather than letting the string grow past DURATION_MAX_WIDTH.
+        let days = secs / 86_400;
+        match days > DURATION_DAY_CAP {
+            true => format!("{DURATION_DAY_CAP}d+"),
+            false => format!("{days}d{:02}h", (secs % 86_400) / 3600),
+        }
     }
 }
 
+/// Widest string [`format_size`] can produce, as in `1000.0 KiB`.
+///
+/// Columns are sized from this rather than from a guess, because a cell one
+/// column short does not wrap or ellipsize, it silently drops a digit and
+/// reports a different number.
+pub const SIZE_MAX_WIDTH: usize = 10;
+
+/// Widest string [`format_speed`] can produce, as in `1000.0 KiB/s`.
+pub const SPEED_MAX_WIDTH: usize = SIZE_MAX_WIDTH + 2;
+
+/// Widest string [`format_percent`] can produce, as in `100.0%`.
+pub const PERCENT_MAX_WIDTH: usize = 6;
+
+/// Widest string [`format_ratio`] can produce, as in `999.99`.
+pub const RATIO_MAX_WIDTH: usize = 6;
+
+/// Widest string [`format_duration`] can produce, as in `23h59m`.
+pub const DURATION_MAX_WIDTH: usize = 6;
+
+/// Largest ratio shown before it collapses to `999+`.
+const RATIO_CAP: f64 = 999.99;
+
+/// Largest number of days shown before the duration collapses to `99d+`.
+const DURATION_DAY_CAP: u64 = 99;
+
 /// Format a byte count with binary units, e.g. `1.4 GiB`.
 pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Units run to EiB so the mantissa never exceeds four digits: u64::MAX is
+    // just under 16 EiB, which keeps the width bounded at SIZE_MAX_WIDTH.
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if bytes == 0 {
         return "0 B".to_string();
     }
@@ -175,12 +208,98 @@ pub fn format_percent(frac: f64) -> String {
 ///
 /// Returns `0.00` when nothing has been downloaded.
 pub fn format_ratio(ratio: f64) -> String {
-    format!("{:.2}", ratio.max(0.0))
+    let ratio = ratio.max(0.0);
+    // Long-lived seeds can reach ratios that would outgrow the column.
+    match ratio > RATIO_CAP {
+        true => "999+".to_string(),
+        false => format!("{ratio:.2}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values that sit at or near every formatting boundary, including the
+    /// 1000-to-1023 band of each unit that produces the widest strings.
+    fn boundary_bytes() -> Vec<u64> {
+        let mut values = vec![0, 1, 512, 1023, 1024, u64::MAX];
+        for power in 1..=6u32 {
+            let unit = 1024f64.powi(power as i32);
+            for mantissa in [1.0, 999.0, 999.9, 1000.0, 1023.0, 1023.9] {
+                values.push((mantissa * unit) as u64);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn size_never_exceeds_its_declared_maximum() {
+        for bytes in boundary_bytes() {
+            let text = format_size(bytes);
+            assert!(
+                display_width(&text) <= SIZE_MAX_WIDTH,
+                "format_size({bytes}) = {text:?} is wider than {SIZE_MAX_WIDTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_never_exceeds_its_declared_maximum() {
+        for bytes in boundary_bytes() {
+            let text = format_speed(bytes);
+            assert!(
+                display_width(&text) <= SPEED_MAX_WIDTH,
+                "format_speed({bytes}) = {text:?} is wider than {SPEED_MAX_WIDTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_never_exceeds_its_declared_maximum() {
+        for frac in [-1.0, 0.0, 0.001, 0.5, 0.9999, 1.0, 2.0] {
+            let text = format_percent(frac);
+            assert!(display_width(&text) <= PERCENT_MAX_WIDTH, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn ratio_never_exceeds_its_declared_maximum() {
+        for ratio in [-1.0, 0.0, 0.005, 1.0, 99.994, 999.99, 1000.0, 1e12] {
+            let text = format_ratio(ratio);
+            assert!(
+                display_width(&text) <= RATIO_MAX_WIDTH,
+                "format_ratio({ratio}) = {text:?} is wider than {RATIO_MAX_WIDTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_never_exceeds_its_declared_maximum() {
+        let seconds = [0, 59, 60, 3599, 3600, 86_399, 86_400, 99 * 86_400, u64::MAX];
+        for secs in seconds {
+            let text = format_duration(Duration::from_secs(secs));
+            assert!(
+                display_width(&text) <= DURATION_MAX_WIDTH,
+                "format_duration({secs}s) = {text:?} is wider than {DURATION_MAX_WIDTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_digit_values_keep_their_leading_digit() {
+        // The exact case the list was misreporting as `000.0 KiB`.
+        assert_eq!(format_size(1024 * 1000), "1000.0 KiB");
+        assert_eq!(format_speed(1024 * 1000), "1000.0 KiB/s");
+    }
+
+    #[test]
+    fn huge_values_stay_bounded() {
+        assert_eq!(format_ratio(5000.0), "999+");
+        assert_eq!(format_duration(Duration::from_secs(1000 * 86_400)), "99d+");
+        // u64::MAX bytes lands in EiB rather than a runaway TiB mantissa.
+        assert!(format_size(u64::MAX).ends_with(" EiB"));
+    }
 
     #[test]
     fn sizes_use_binary_units() {

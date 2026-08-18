@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(48, 8, area);
     frame.render_widget(Clear, popup);
 
-    let block = theme::block().title(theme::title(" Rate limits ".to_string()));
+    let block = theme::overlay_block("Rate limits");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -30,9 +30,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     let field_line = |label: &str, value: &str, focused: bool| {
         let box_style = if focused {
-            Style::new().fg(theme::WARN).add_modifier(Modifier::BOLD)
+            theme::warning().add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(theme::DIM)
+            theme::muted()
         };
         let shown = if value.is_empty() && !focused {
             "unlimited".to_string()
@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             format!("{value:<FIELD_WIDTH$}")
         };
         Line::from(vec![
-            Span::styled(format!("  {label:<10}"), Style::new().fg(theme::WARN)),
+            Span::styled(format!("  {label:<10}"), theme::warning()),
             Span::styled(format!("[{shown}]"), box_style),
         ])
     };
@@ -52,7 +52,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(Span::styled(
             "  blank = unlimited \u{b7} units K/M/G",
-            Style::new().fg(theme::DIM),
+            theme::muted(),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);

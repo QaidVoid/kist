@@ -254,7 +254,6 @@ impl Engine {
         let handle = self.session.get(TorrentIdOrHash::Id(id))?;
         let stats = handle.stats();
         let infohash = handle.shared().info_hash.as_string();
-        let name = handle.name().unwrap_or_else(|| infohash.clone());
         let (down_speed, up_speed, peers) = live_speeds(&stats);
         let file_progress = stats.file_progress.clone();
 
@@ -318,7 +317,6 @@ impl Engine {
             .unwrap_or_default();
 
         Some(DetailSnapshot {
-            name,
             infohash,
             state: to_row_state(stats.state),
             total_bytes: stats.total_bytes,
@@ -700,8 +698,9 @@ fn live_speeds(stats: &TorrentStats) -> (u64, u64, usize) {
 /// Map a librqbit managed torrent into a plain [`TorrentRow`].
 fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
     let stats = handle.stats();
-    let infohash = handle.shared().info_hash.as_string();
-    let name = handle.name().unwrap_or_else(|| infohash.clone());
+    let name = handle
+        .name()
+        .unwrap_or_else(|| handle.shared().info_hash.as_string());
     let (down_speed, up_speed, peers) = live_speeds(&stats);
     let eta = handle
         .live()
@@ -710,7 +709,6 @@ fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
     TorrentRow {
         id,
         name,
-        infohash,
         total_bytes: stats.total_bytes,
         progress_bytes: stats.progress_bytes,
         uploaded_bytes: stats.uploaded_bytes,

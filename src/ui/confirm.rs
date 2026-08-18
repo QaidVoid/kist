@@ -1,112 +1,97 @@
 //! Remove-confirmation modal overlay.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{App, Mode};
-use crate::format::{display_width, format_size, truncate_end};
+use crate::format::{format_percent, format_size, truncate_end};
 use crate::ui::theme;
 
-/// Widest the dialog content may grow before the name is truncated.
-const MAX_CONTENT_WIDTH: usize = 70;
-/// Narrowest dialog that still fits the action buttons comfortably.
-const MIN_CONTENT_WIDTH: usize = 40;
+/// Widest the dialog grows before the torrent name is truncated.
+const MAX_WIDTH: u16 = 60;
+/// Narrowest dialog that still reads as a sentence.
+const MIN_WIDTH: u16 = 34;
 
-/// Render a centered confirmation dialog describing the torrent being removed.
+/// Render the removal confirmation.
+///
+/// The two outcomes are affordances in a column so their keys line up, and the
+/// destructive one is marked apart. Everything here has to survive the minimum
+/// supported terminal: an option the user cannot see is an option they cannot
+/// weigh, and the one that would be pushed off-screen is the dangerous one.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let Mode::ConfirmRemove { id } = app.mode else {
         return;
     };
     let row = app.snapshot.rows.iter().find(|row| row.id == id);
-    let name = row
-        .map(|r| r.name.clone())
-        .unwrap_or_else(|| format!("torrent {id}"));
+    let count = app.bulk_target_count(id);
 
-    // Fit the dialog to its content, clamped to the frame.
-    let max_content = (area.width.saturating_sub(6) as usize).min(MAX_CONTENT_WIDTH);
-    let name_display = truncate_end(&name, max_content.saturating_sub(5));
-    let content_width = display_width(&name_display)
-        .saturating_add(5)
-        .clamp(MIN_CONTENT_WIDTH.min(max_content), max_content);
+    let width = MAX_WIDTH.clamp(MIN_WIDTH.min(area.width), area.width.saturating_sub(2));
+    let inner_width = width.saturating_sub(4) as usize;
 
-    let popup = centered_fixed(content_width as u16 + 2, 13, area);
+    let heading = match count > 1 {
+        true => format!("Remove {count} torrents?"),
+        false => "Remove torrent?".to_string(),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    match (count > 1, row) {
+        (true, _) => lines.push(Line::from(Span::styled(
+            format!(" {count} torrents are marked"),
+            theme::secondary(),
+        ))),
+        (false, Some(r)) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", theme::state_glyph(r.state, r.finished)),
+                    theme::state_style(r.state, r.finished),
+                ),
+                Span::styled(
+                    truncate_end(&r.name, inner_width.saturating_sub(3)),
+                    theme::emphasis(),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "   {} \u{b7} {} downloaded",
+                    format_size(r.total_bytes),
+                    format_percent(r.progress_frac())
+                ),
+                theme::muted(),
+            )));
+        }
+        (false, None) => lines.push(Line::from(Span::styled(
+            " (no longer in the list)",
+            theme::muted(),
+        ))),
+    }
+
+    lines.push(Line::from(theme::action("f", "forget, keep the files")));
+    lines.push(Line::from(theme::danger_action(
+        "D",
+        "delete the files from disk",
+    )));
+    lines.push(theme::dismiss_hint("esc", "cancel"));
+
+    // Trim the least important line first rather than letting the bottom of
+    // the dialog fall off the screen.
+    let max_inner = area.height.saturating_sub(2) as usize;
+    while lines.len() > max_inner && lines.len() > 3 {
+        lines.remove(1);
+    }
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = centered(width, height, area);
     frame.render_widget(Clear, popup);
-
-    let block = theme::block()
-        .title(Span::styled(
-            " Confirm removal ",
-            Style::new().fg(theme::WARN).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::new().fg(theme::WARN));
-
-    let glyph_span = match row {
-        Some(r) => Span::styled(
-            format!("  {} ", theme::state_glyph(r.state, r.finished)),
-            theme::state_style(r.state, r.finished),
-        ),
-        None => Span::raw("  "),
-    };
-    let stats = match row {
-        Some(r) => format!(
-            "     {} \u{b7} {:.1}% downloaded",
-            format_size(r.total_bytes),
-            r.progress_pct()
-        ),
-        None => "     (no longer in the list)".to_string(),
-    };
-
-    let lines = vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            " Remove this torrent?",
-            Style::new().add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            glyph_span,
-            Span::styled(
-                name_display,
-                Style::new().fg(theme::ERROR).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(stats, Style::new().fg(theme::DIM))),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                " f Forget ",
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  keeps files", Style::new().fg(theme::DIM)),
-        ])
-        .alignment(Alignment::Center),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                " D Delete ",
-                Style::new()
-                    .bg(theme::ERROR)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  deletes files from disk", Style::new().fg(theme::ERROR)),
-        ])
-        .alignment(Alignment::Center),
-        Line::raw(""),
-        Line::from(Span::styled("n / esc  cancel", Style::new().fg(theme::DIM)))
-            .alignment(Alignment::Center),
-    ];
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(theme::danger_overlay_block(&heading)),
+        popup,
+    );
 }
 
-/// Center a fixed-size popup within `area`, clamped to the frame.
-fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+/// Center a popup within `area`, clamped to the frame.
+fn centered(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width).max(1);
     let height = height.min(area.height).max(1);
     let x = area.x + (area.width - width) / 2;
