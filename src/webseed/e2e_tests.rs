@@ -4,11 +4,13 @@
 //! they exercise the whole path: handshake, bitfield, piece requests, ranged
 //! GETs, and the session's own hash verification.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use librqbit::{CreateTorrentOptions, Session, SessionOptions, create_torrent};
+use librqbit::spawn_utils::BlockingSpawner;
+use librqbit::{CreateTorrentOptions, ListenerOptions, Session, SessionOptions, create_torrent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -200,20 +202,18 @@ async fn respond(
     stream.flush().await
 }
 
-/// Start a session whose peer listener is on a free loopback port.
+/// Start a session listening on a loopback port chosen by the OS, so tests
+/// never collide with each other or reach the network.
 async fn session(download_dir: &Path) -> Arc<Session> {
-    // Probe for a free port, then give librqbit a small range around it so a
-    // race for that exact port does not fail the test.
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
     Session::new_with_opts(
         download_dir.to_path_buf(),
         SessionOptions {
-            disable_dht: true,
+            dht: None,
             persistence: None,
-            listen_port_range: Some(port..port.saturating_add(20)),
+            listen: Some(ListenerOptions {
+                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )
@@ -239,6 +239,7 @@ async fn attach(
             piece_length: Some(32 * 1024),
             ..Default::default()
         },
+        &BlockingSpawner::new(1),
     )
     .await
     .unwrap();
@@ -253,8 +254,8 @@ async fn attach(
         .unwrap();
     handle.wait_until_initialized().await.unwrap();
 
-    let listen_port = session.tcp_listen_port().unwrap();
-    let (map, params) = crate::engine::bridge_setup(&handle, listen_port, url, 4).unwrap();
+    let listen_addr = crate::engine::loopback_target(session.listen_addr().unwrap());
+    let (map, params) = crate::engine::bridge_setup(&handle, listen_addr, url, 4).unwrap();
     let fetcher = Arc::new(Fetcher::new(
         map,
         mode_status.clone(),

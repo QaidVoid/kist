@@ -10,6 +10,7 @@
 //! the session offers, so it cannot consume upload bandwidth from the session.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use librqbit::ByteBuf;
 use librqbit_core::Id20;
 use librqbit_core::peer_id::generate_peer_id;
-use librqbit_peer_protocol::{Handshake, Message, MessageBorrowed, Piece};
+use librqbit_peer_protocol::{Handshake, Message, Piece};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
@@ -33,6 +34,13 @@ const PEER_ID_PREFIX: &[u8; 8] = b"-KIws01-";
 
 /// Serialized keep-alive message (a bare zero length prefix).
 const KEEP_ALIVE: [u8; 4] = [0, 0, 0, 0];
+
+/// Wire size of a BitTorrent v1 handshake.
+const HANDSHAKE_LEN: usize = 68;
+
+/// Bytes a message needs on the wire beyond its variable-length payload: the
+/// length prefix, the message id, and a `piece` message's index and offset.
+const MESSAGE_OVERHEAD: usize = 13;
 
 /// How often to send a keep-alive. librqbit drops a peer that is silent for
 /// longer than its read timeout, which defaults to ten seconds.
@@ -54,8 +62,8 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// Everything the bridge needs to present itself as a peer for one torrent.
 #[derive(Debug, Clone)]
 pub struct BridgeParams {
-    /// Port the session listens on for incoming peer connections.
-    pub listen_port: u16,
+    /// Address of the session's own listener for incoming peer connections.
+    pub listen_addr: SocketAddr,
     /// Infohash of the torrent to attach to.
     pub info_hash: Id20,
     /// The session's peer id, so the bridge can avoid colliding with it.
@@ -113,7 +121,7 @@ async fn serve(
     fetcher: &Arc<Fetcher>,
     status: &Arc<SeedStatus>,
 ) -> Result<(), BridgeError> {
-    let mut stream = TcpStream::connect(("127.0.0.1", params.listen_port))
+    let mut stream = TcpStream::connect(params.listen_addr)
         .await
         .map_err(|e| BridgeError::Link(format!("connect: {e}")))?;
     let _ = stream.set_nodelay(true);
@@ -142,7 +150,7 @@ async fn serve(
     loop {
         // Drain everything already buffered before waiting for more.
         while let Some(frame) = frames.take_frame().map_err(BridgeError::Link)? {
-            let message = MessageBorrowed::deserialize(&frame)
+            let message = Message::deserialize(&frame, &[])
                 .map_err(|e| BridgeError::Link(format!("bad message: {e:?}")))?
                 .0;
             match message {
@@ -223,18 +231,18 @@ async fn handshake(
     let mut ours = Handshake::new(params.info_hash, peer_id);
     // Opting out of BEP 10 means the session never sends an extended handshake,
     // so the bridge does not have to implement ut_metadata or ut_pex.
-    ours.reserved = [0u8; 8];
-    let mut buf = Vec::with_capacity(68);
-    ours.serialize(&mut buf);
+    ours.reserved = 0;
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    let len = ours.serialize_unchecked_len(&mut buf);
     write
-        .write_all(&buf)
+        .write_all(&buf[..len])
         .await
         .map_err(|e| BridgeError::Link(format!("write handshake: {e}")))?;
 
     loop {
         match Handshake::deserialize(frames.buffered()) {
             Ok((theirs, size)) => {
-                if theirs.info_hash != params.info_hash.0 {
+                if theirs.info_hash != params.info_hash {
                     return Err(BridgeError::Link(
                         "session sent a different infohash".into(),
                     ));
@@ -269,18 +277,27 @@ async fn send_greeting(
         *last = 0xFFu8 << spare;
     }
 
-    let mut buf = Vec::new();
     let mut out = Vec::new();
     for message in [Message::Bitfield(ByteBuf(&bits)), Message::Unchoke] {
-        let len = message
-            .serialize(&mut buf, &Default::default)
-            .map_err(|e| BridgeError::Link(format!("serialize: {e}")))?;
-        out.extend_from_slice(&buf[..len]);
+        out.extend_from_slice(&serialize(&message, bits.len())?);
     }
     write
         .write_all(&out)
         .await
         .map_err(|e| BridgeError::Link(format!("write bitfield: {e}")))
+}
+
+/// Serialize one message into a fresh buffer.
+///
+/// librqbit serializes into a caller-sized slice, so `payload` is the size of
+/// whatever variable-length body the message carries.
+fn serialize(message: &Message<'_>, payload: usize) -> Result<Vec<u8>, BridgeError> {
+    let mut buf = vec![0u8; MESSAGE_OVERHEAD + payload];
+    let len = message
+        .serialize(&mut buf, &Default::default)
+        .map_err(|e| BridgeError::Link(format!("serialize: {e}")))?;
+    buf.truncate(len);
+    Ok(buf)
 }
 
 /// A block the session asked for, as `(piece, offset in piece, length)`.
@@ -310,16 +327,10 @@ async fn serve_block(
         return Ok(());
     }
 
-    let message = Message::Piece(Piece {
-        index,
-        begin,
-        block: ByteBuf(&block),
-    });
-    let mut buf = Vec::with_capacity(block.len() + 16);
-    let len = message
-        .serialize(&mut buf, &Default::default)
-        .map_err(|e| e.to_string())?;
-    buf.truncate(len);
+    let message = Message::Piece(Piece::from_data(index, begin, &block));
+    let buf = serialize(&message, block.len()).map_err(|e| match e {
+        BridgeError::Seed(reason) | BridgeError::Link(reason) => reason,
+    })?;
     status.add_served(block.len() as u64);
     let _ = out.send(buf).await;
     Ok(())
@@ -384,7 +395,7 @@ mod tests {
 
     fn params(piece_length: u32, total_pieces: u32) -> BridgeParams {
         BridgeParams {
-            listen_port: 1,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 1).into(),
             info_hash: Id20::new([0u8; 20]),
             session_peer_id: Id20::new([1u8; 20]),
             piece_length,

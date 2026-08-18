@@ -84,7 +84,8 @@ kist reads a TOML config file from the OS config directory (`~/.config/kist/conf
 # Where downloaded torrents are written (defaults to the OS download folder).
 download_directory = "/home/you/Downloads"
 
-# Inclusive port range for incoming peer connections.
+# Inclusive port range for incoming peer connections. The first free port in
+# the range is used; if all of them are taken, the OS picks one instead.
 listen_ports = [6881, 6889]
 
 # Global speed caps as human sizes (e.g. "2M", "512K"); omit for unlimited.
@@ -116,7 +117,7 @@ Press `w` on a torrent to attach an HTTP or HTTPS URL as a web seed, and the sou
 
 kist follows [BEP 19](https://www.bittorrent.org/beps/bep_0019.html) for the URL layout. A single-file torrent uses the URL as given, or appends the torrent name when the URL ends in `/`. A multi-file torrent fetches each file from `<url>/<name>/<path>`. Data arriving over HTTP is hash-checked exactly like data from the swarm, so a bad mirror costs you a refetch and nothing more.
 
-Because librqbit has no web seed support of its own, kist runs each seed as a loopback BitTorrent peer that answers piece requests with ranged HTTP GETs. This means web seeds need the incoming peer port to bind successfully, and a seed shows up in the peers tab labelled `web seed`.
+Because librqbit has no web seed support of its own, kist runs each seed as a loopback BitTorrent peer that answers piece requests with ranged HTTP GETs. So a web seed needs the incoming peer listener to be up, and a seed shows up in the peers tab labelled `web seed`.
 
 ## License
 

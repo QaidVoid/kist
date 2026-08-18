@@ -6,6 +6,7 @@
 //! (and status messages) back to the UI.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ManagedTorrent, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStats, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
+    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
+    TorrentStatsState,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
@@ -78,9 +80,13 @@ impl Engine {
     /// Returns an error if the session cannot initialize (for example an
     /// invalid or unwritable download directory).
     pub async fn new(config: &Config) -> Result<Self> {
+        let (listen_addr, listen_warning) = resolve_listen_addr(config.listen_port_range());
         let opts = SessionOptions {
-            disable_dht: !config.enable_dht,
-            listen_port_range: Some(config.listen_port_range()),
+            dht: config.enable_dht.then(DhtSessionConfig::default),
+            listen: Some(ListenerOptions {
+                listen_addr,
+                ..Default::default()
+            }),
             // Persist the torrent list so it survives restarts, in a kist-owned
             // folder (falling back to librqbit's default if the dir is unknown).
             persistence: if config.enable_session_persistence {
@@ -106,7 +112,8 @@ impl Engine {
             concurrency: config.web_seed_concurrency.clamp(1, 16),
             state_path: crate::config::web_seed_state_file().ok(),
         };
-        let (seeds, startup_warnings) = restore_web_seeds(&session, &web_seeds);
+        let (seeds, mut startup_warnings) = restore_web_seeds(&session, &web_seeds);
+        startup_warnings.extend(listen_warning);
 
         Ok(Self {
             session,
@@ -169,9 +176,9 @@ impl Engine {
             return Ok(Vec::new());
         };
         let mut files = Vec::new();
-        for details in list.info.iter_file_details().context("no file metadata")? {
+        for details in list.info.iter_file_details() {
             files.push(PreviewFile {
-                name: details.filename.to_string().unwrap_or_default(),
+                name: details.filename.to_string(),
                 size: details.len,
             });
         }
@@ -285,11 +292,13 @@ impl Engine {
             .collect();
         trackers.sort();
 
+        // The bitfield is byte-aligned, so it carries spare bits past the last
+        // piece that the piece map must not show.
         let pieces = self
             .api
             .api_dump_haves(TorrentIdOrHash::Id(id))
             .ok()
-            .and_then(|dump| parse_haves(&dump));
+            .map(|(have, total)| have.iter().map(|bit| *bit).take(total as usize).collect());
 
         // `only_files == None` means every file is included.
         let only_files = handle.only_files();
@@ -394,7 +403,7 @@ impl Engine {
         if !self.web_seeds.enabled {
             return;
         }
-        let Some(listen_port) = self.session.tcp_listen_port() else {
+        let Some(listen) = self.session.listen_addr() else {
             return;
         };
         let torrents: HashMap<String, Arc<ManagedTorrent>> = self.session.with_torrents(|list| {
@@ -418,7 +427,7 @@ impl Engine {
                 let failed = entry.status.state() == WebSeedState::Failed;
                 match (&entry.task, handle) {
                     (None, Some(handle)) if !failed => {
-                        entry.task = self.start_bridge(handle, listen_port, entry);
+                        entry.task = self.start_bridge(handle, loopback_target(listen), entry);
                     }
                     (Some(task), None) => {
                         task.abort();
@@ -440,11 +449,11 @@ impl Engine {
     fn start_bridge(
         &self,
         handle: &Arc<ManagedTorrent>,
-        listen_port: u16,
+        listen_addr: SocketAddr,
         entry: &SeedEntry,
     ) -> Option<AbortHandle> {
         let concurrency = self.web_seeds.concurrency;
-        let (map, params) = bridge_setup(handle, listen_port, &entry.url, concurrency)?;
+        let (map, params) = bridge_setup(handle, listen_addr, &entry.url, concurrency)?;
         let status = entry.status.clone();
         let fetcher = Arc::new(Fetcher::new(
             map,
@@ -503,13 +512,76 @@ impl Engine {
     }
 }
 
+/// Address families tried when binding the peer listener, dual-stack first so
+/// both IPv4 and IPv6 peers can connect.
+const LISTEN_FAMILIES: [IpAddr; 2] = [
+    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+];
+
+/// Pick the address to listen on for incoming peer connections.
+///
+/// librqbit binds a single address and fails the whole session if it is taken,
+/// where it used to walk a port range itself. kist keeps its configured range
+/// meaningful by probing it here, and falls back to an OS-assigned port so a
+/// port clash costs the preferred port rather than preventing startup.
+fn resolve_listen_addr(ports: std::ops::Range<u16>) -> (SocketAddr, Option<String>) {
+    for ip in LISTEN_FAMILIES {
+        if let Some(addr) = ports
+            .clone()
+            .map(|port| SocketAddr::new(ip, port))
+            .find(bindable)
+        {
+            return (addr, None);
+        }
+    }
+    let warning = format!(
+        "ports {}-{} are unavailable, letting the OS choose the peer port",
+        ports.start,
+        ports.end.saturating_sub(1)
+    );
+    for ip in LISTEN_FAMILIES {
+        let any = SocketAddr::new(ip, 0);
+        if bindable(&any) {
+            return (any, Some(warning));
+        }
+    }
+    // Nothing binds at all; hand back the configured port so librqbit reports
+    // the real reason rather than kist guessing at it.
+    (
+        SocketAddr::new(LISTEN_FAMILIES[0], ports.start),
+        Some(warning),
+    )
+}
+
+/// Whether `addr` can be bound right now. The probe socket is closed
+/// immediately, so librqbit binds it moments later.
+fn bindable(addr: &SocketAddr) -> bool {
+    std::net::TcpListener::bind(addr).is_ok()
+}
+
+/// Where a bridge should dial to reach the session's own peer listener.
+///
+/// An unspecified bind address is not connectable, so it becomes loopback;
+/// anything else is already the address the session is reachable on.
+pub(crate) fn loopback_target(listen: SocketAddr) -> SocketAddr {
+    if !listen.ip().is_unspecified() {
+        return listen;
+    }
+    let ip = match listen.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    SocketAddr::new(ip, listen.port())
+}
+
 /// Build the file map and bridge parameters for one web seed on a torrent.
 ///
 /// Returns `None` while the torrent's metadata is still resolving, since the
 /// file layout is what the mapping is built from.
 pub(crate) fn bridge_setup(
     handle: &ManagedTorrent,
-    listen_port: u16,
+    listen_addr: SocketAddr,
     url: &str,
     concurrency: usize,
 ) -> Option<(FileMap, BridgeParams)> {
@@ -518,8 +590,9 @@ pub(crate) fn bridge_setup(
     handle
         .with_metadata(|metadata| {
             let name = metadata
-                .name
-                .clone()
+                .info
+                .name()
+                .map(|name| name.into_owned())
                 .unwrap_or_else(|| info_hash.as_string());
             let files: Vec<TorrentFile> = metadata
                 .file_infos
@@ -534,14 +607,15 @@ pub(crate) fn bridge_setup(
                     len: file.len,
                 })
                 .collect();
-            let map = FileMap::new(url, &name, metadata.info.files.is_some(), &files);
+            let lengths = metadata.lengths();
+            let map = FileMap::new(url, &name, metadata.info.info().files.is_some(), &files);
             let params = BridgeParams {
-                listen_port,
+                listen_addr,
                 info_hash,
                 session_peer_id: shared.peer_id,
-                piece_length: metadata.lengths.default_piece_length(),
-                total_pieces: metadata.lengths.total_pieces(),
-                bitfield_bytes: metadata.lengths.piece_bitfield_bytes(),
+                piece_length: lengths.default_piece_length(),
+                total_pieces: lengths.total_pieces(),
+                bitfield_bytes: lengths.piece_bitfield_bytes(),
                 concurrency,
             };
             (map, params)
@@ -562,7 +636,7 @@ fn restore_web_seeds(
     if !settings.enabled {
         return (seeds, warnings);
     }
-    if session.tcp_listen_port().is_none() {
+    if session.listen_addr().is_none() {
         warnings.push("web seeds need an incoming peer port, but none was bound".to_string());
     }
     let Some(path) = &settings.state_path else {
@@ -617,7 +691,7 @@ fn live_speeds(stats: &TorrentStats) -> (u64, u64, usize) {
         Some(live) => (
             mbps_to_bytes(live.download_speed.mbps),
             mbps_to_bytes(live.upload_speed.mbps),
-            live.snapshot.peer_stats.live,
+            live.snapshot.peer_stats.live as usize,
         ),
         None => (0, 0, 0),
     }
@@ -650,29 +724,11 @@ fn to_row(id: usize, handle: &ManagedTorrent) -> TorrentRow {
     }
 }
 
-/// Parse librqbit's have-pieces debug dump into per-piece flags.
-///
-/// The dump ends in a `[1, 0, 1, ...]` list; anything unexpected yields `None`
-/// so the UI simply omits the piece map.
-fn parse_haves(dump: &str) -> Option<Vec<bool>> {
-    let (_, list) = dump.rsplit_once('[')?;
-    let list = list.trim_end().strip_suffix(']')?;
-    let bits: Vec<bool> = list
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .map(|t| match t {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    if bits.is_empty() { None } else { Some(bits) }
-}
-
 fn to_row_state(state: TorrentStatsState) -> RowState {
     match state {
-        TorrentStatsState::Initializing => RowState::Initializing,
+        // The paused flag here is the user's intent for once initializing
+        // finishes; while it runs the torrent really is initializing.
+        TorrentStatsState::Initializing { .. } => RowState::Initializing,
         TorrentStatsState::Live => RowState::Live,
         TorrentStatsState::Paused => RowState::Paused,
         TorrentStatsState::Error => RowState::Error,
@@ -1044,18 +1100,62 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use librqbit::Magnet;
 
     #[test]
-    fn parse_haves_extracts_bit_list() {
-        let dump = "BitSlice<u8, Msb0> { addr: 0x7f01, head: 000, bits: 5 } [1, 0, 1, 1, 0]";
-        assert_eq!(
-            super::parse_haves(dump),
-            Some(vec![true, false, true, true, false])
+    fn listen_addr_uses_the_configured_range_when_free() {
+        // Ask for a range starting at a port the OS just handed out and freed,
+        // which is as close to "known free" as a test can get.
+        let probe = std::net::TcpListener::bind("[::]:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (addr, warning) = resolve_listen_addr(port..port + 4);
+        assert!(
+            (port..port + 4).contains(&addr.port()),
+            "expected a port from the range, got {addr}"
         );
-        assert_eq!(super::parse_haves("[]"), None);
-        assert_eq!(super::parse_haves("no list here"), None);
-        assert_eq!(super::parse_haves("[1, 2]"), None);
+        assert!(warning.is_none(), "a usable range must not warn");
+    }
+
+    #[test]
+    fn listen_addr_falls_back_when_the_range_is_taken() {
+        // A one-port range around a port we hold, so the whole range is taken.
+        // The listener is dual-stack, so it blocks both families kist tries.
+        let held = std::net::TcpListener::bind("[::]:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let range = port..port + 1;
+
+        let (addr, warning) = resolve_listen_addr(range.clone());
+        assert!(
+            !range.contains(&addr.port()),
+            "a taken range must not be reused"
+        );
+        assert!(
+            warning.is_some_and(|w| w.contains("unavailable")),
+            "falling back to another port must be reported"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn bridges_dial_loopback_for_unspecified_listeners() {
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6881);
+        assert_eq!(
+            loopback_target(v6),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6881)
+        );
+
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6881);
+        assert_eq!(
+            loopback_target(v4),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881)
+        );
+
+        // A listener bound to a real address is already reachable there.
+        let specific = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 6881);
+        assert_eq!(loopback_target(specific), specific);
     }
 
     #[test]
