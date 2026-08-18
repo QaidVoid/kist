@@ -32,20 +32,39 @@ jobs:
               RUNNER: ubuntu-24.04-arm,
               TARGET: aarch64-unknown-linux-musl,
             }
+          - {
+              NAME: x86_64-windows,
+              RUNNER: windows-latest,
+              TARGET: x86_64-pc-windows-msvc,
+            }
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools b3sum
 
+      # The TLS and SHA-1 backends (aws-lc-sys, ring) assemble their own
+      # primitives, and NASM is not on the Windows runner by default.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.build.TARGET }}
+
+      # No packaged b3sum on Windows, and the checksums are BLAKE3 on every
+      # other target, so build it rather than switching hash on one platform.
+      - name: Install b3sum (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo install b3sum --locked
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.build.TARGET }}
@@ -55,17 +74,34 @@ jobs:
         run: |
           mkdir -p release
           cp LICENSE-APACHE LICENSE-MIT README.md release/
-          cp "target/${{ matrix.build.TARGET }}/release/kist" release/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.build.TARGET }}/release/kist.exe" release/
+          else
+            cp "target/${{ matrix.build.TARGET }}/release/kist" release/
+          fi
 
       - name: Create release artifacts
         shell: bash
         run: |
-          cp release/kist kist-${{ matrix.build.NAME }}
-          b3sum kist-${{ matrix.build.NAME }} > kist-${{ matrix.build.NAME }}.b3sum
-          tar -cJvf kist-${{ matrix.build.NAME }}.tar.xz release/
-          b3sum kist-${{ matrix.build.NAME }}.tar.xz > kist-${{ matrix.build.NAME }}.tar.xz.b3sum
+          name="kist-${{ matrix.build.NAME }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Windows users expect a zip, and the bare binary keeps its
+            # extension so it stays runnable once downloaded.
+            cp "release/kist.exe" "$name.exe"
+            b3sum "$name.exe" > "$name.exe.b3sum"
+            7z a "$name.zip" ./release/*
+            b3sum "$name.zip" > "$name.zip.b3sum"
+          else
+            cp release/kist "$name"
+            b3sum "$name" > "$name.b3sum"
+            tar -cJvf "$name.tar.xz" release/
+            b3sum "$name.tar.xz" > "$name.tar.xz.b3sum"
+          fi
 
+      # Only a real release publishes. On a manual run github.ref is a branch,
+      # which would otherwise create a release tagged after the branch.
       - name: Upload to release
+        if: github.event_name == 'release'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -75,7 +111,16 @@ jobs:
           tag: ${{ github.ref }}
 
       - name: Attest Build Provenance
+        if: github.event_name == 'release'
         uses: actions/attest@v4
         with:
           subject-name: "kist-${{ matrix.build.NAME }}"
           subject-path: kist-${{ matrix.build.NAME }}*
+
+      - name: Upload artifacts for inspection
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kist-${{ matrix.build.NAME }}
+          path: kist-${{ matrix.build.NAME }}*
+          retention-days: 7

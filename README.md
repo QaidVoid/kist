@@ -22,7 +22,7 @@ kist keeps things minimal: add a torrent, watch it download, and get out of your
 
 ### Prebuilt binaries
 
-Static Linux binaries for x86_64 and aarch64 are available on the [releases page](https://github.com/QaidVoid/kist/releases), along with BLAKE3 checksums and build provenance attestations.
+Static Linux binaries for x86_64 and aarch64, and an x86_64 Windows binary, are available on the [releases page](https://github.com/QaidVoid/kist/releases), along with BLAKE3 checksums and build provenance attestations.
 
 ### From crates.io
 
