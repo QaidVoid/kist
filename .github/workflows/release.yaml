@@ -39,7 +39,7 @@ jobs:
             }
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -50,9 +50,11 @@ jobs:
 
       # The TLS and SHA-1 backends (aws-lc-sys, ring) assemble their own
       # primitives, and NASM is not on the Windows runner by default.
+      # Pinned: v1.5.2 is the newest release and still runs on node20, so the
+      # runner warns about it. Revisit when upstream ships a node24 build.
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@v1.5.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -119,7 +121,7 @@ jobs:
 
       - name: Upload artifacts for inspection
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kist-${{ matrix.build.NAME }}
           path: kist-${{ matrix.build.NAME }}*
