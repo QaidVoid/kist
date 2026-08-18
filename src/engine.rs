@@ -7,10 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
@@ -23,15 +24,52 @@ use tokio::task::AbortHandle;
 use crate::config::Config;
 use crate::error;
 use crate::model::{
-    DetailFile, DetailSnapshot, PeerRow, PreviewFile, RowState, Snapshot, TorrentRow,
+    DetailFile, DetailSnapshot, PeerRow, PreviewFile, RowState, Snapshot, TorrentRow, WebSeedRow,
+    WebSeedState,
 };
 use crate::search::{self, SearchOutcome};
+use crate::webseed::bridge::BridgeParams;
+use crate::webseed::fetch::Fetcher;
+use crate::webseed::mapping::{FileMap, TorrentFile};
+use crate::webseed::state::SeedStore;
+use crate::webseed::{self, SeedStatus};
 
 /// Owns the librqbit session and translates it into plain view models.
 pub struct Engine {
     session: Arc<Session>,
     /// librqbit API wrapper; the only public route to some data (piece haves).
     api: Api,
+    /// Web seed settings resolved from the config.
+    web_seeds: WebSeedSettings,
+    /// Attached web seeds and their bridge tasks, keyed by infohash. Infohash
+    /// rather than torrent id, because ids are not stable across restarts.
+    seeds: Mutex<HashMap<String, Vec<SeedEntry>>>,
+    /// Non-fatal problems found while starting up, published once the UI is up.
+    startup_warnings: Vec<String>,
+}
+
+/// Web seed settings resolved from the config once at startup.
+struct WebSeedSettings {
+    enabled: bool,
+    concurrency: usize,
+    state_path: Option<PathBuf>,
+}
+
+/// One web seed attached to a torrent, with its bridge task if it is running.
+struct SeedEntry {
+    url: String,
+    status: Arc<SeedStatus>,
+    task: Option<AbortHandle>,
+}
+
+impl SeedEntry {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            status: Arc::new(SeedStatus::default()),
+            task: None,
+        }
+    }
 }
 
 impl Engine {
@@ -62,7 +100,21 @@ impl Engine {
             .await
             .context("failed to initialize torrent session")?;
         let api = Api::new(session.clone(), None);
-        Ok(Self { session, api })
+
+        let web_seeds = WebSeedSettings {
+            enabled: config.enable_web_seeds,
+            concurrency: config.web_seed_concurrency.clamp(1, 16),
+            state_path: crate::config::web_seed_state_file().ok(),
+        };
+        let (seeds, startup_warnings) = restore_web_seeds(&session, &web_seeds);
+
+        Ok(Self {
+            session,
+            api,
+            web_seeds,
+            seeds: Mutex::new(seeds),
+            startup_warnings,
+        })
     }
 
     /// Add a torrent from a magnet link, `.torrent` file path, or URL.
@@ -203,6 +255,10 @@ impl Engine {
         let eta = live
             .as_ref()
             .and_then(|l| l.down_speed_estimator().time_remaining());
+        // Bridge peers are kist's own web seeds, not swarm members, so the peer
+        // list labels them instead of passing them off as real peers.
+        let bridge_ports = self.web_seed_ports(&infohash);
+        let web_seeds = self.web_seed_rows(&infohash);
         let peer_rows = live
             .map(|l| {
                 let snapshot = l.per_peer_stats_snapshot(Default::default());
@@ -210,6 +266,7 @@ impl Engine {
                     .peers
                     .into_iter()
                     .map(|(addr, p)| PeerRow {
+                        web_seed: is_bridge_addr(&addr, &bridge_ports),
                         addr,
                         state: p.state.to_string(),
                         fetched_bytes: p.counters.fetched_bytes,
@@ -266,6 +323,7 @@ impl Engine {
             files,
             peer_rows,
             trackers,
+            web_seeds,
             pieces,
         })
     }
@@ -274,6 +332,282 @@ impl Engine {
         self.session
             .get(TorrentIdOrHash::Id(id))
             .with_context(|| format!("torrent {id} not found"))
+    }
+
+    /// Non-fatal startup problems, for the UI to show once it is running.
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.startup_warnings
+    }
+
+    /// Attach an HTTP source to a torrent as a web seed.
+    ///
+    /// The bridge starts on the next reconcile, so a torrent whose metadata has
+    /// not resolved yet simply picks the seed up once it does.
+    pub fn attach_web_seed(&self, id: usize, url: String) -> Result<String> {
+        if !self.web_seeds.enabled {
+            bail!("web seeds are disabled");
+        }
+        webseed::validate_url(&url).map_err(|reason| anyhow!("{reason}"))?;
+        let infohash = self.find_handle(id)?.shared().info_hash.as_string();
+
+        let mut seeds = self.seeds.lock().unwrap();
+        let entries = seeds.entry(infohash).or_default();
+        if entries.iter().any(|entry| entry.url == url) {
+            return Ok("web seed already attached".to_string());
+        }
+        entries.push(SeedEntry::new(url));
+        let saved = self.persist(&seeds);
+        drop(seeds);
+
+        self.reconcile_web_seeds();
+        Ok(with_save_result("attached web seed", saved))
+    }
+
+    /// Detach a web seed, stopping its bridge.
+    pub fn detach_web_seed(&self, id: usize, url: &str) -> Result<String> {
+        let infohash = self.find_handle(id)?.shared().info_hash.as_string();
+
+        let mut seeds = self.seeds.lock().unwrap();
+        let entries = seeds
+            .get_mut(&infohash)
+            .with_context(|| format!("torrent {id} has no web seeds"))?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.url == url)
+            .context("web seed not attached")?;
+        if let Some(task) = entries.remove(index).task {
+            task.abort();
+        }
+        if entries.is_empty() {
+            seeds.remove(&infohash);
+        }
+        let saved = self.persist(&seeds);
+        Ok(with_save_result("detached web seed", saved))
+    }
+
+    /// Start and stop bridges so they match the attached seeds and the state of
+    /// their torrents.
+    ///
+    /// Run on the refresh tick rather than driven by events, because librqbit
+    /// does not notify on pause, resume, or metadata resolution.
+    pub fn reconcile_web_seeds(&self) {
+        if !self.web_seeds.enabled {
+            return;
+        }
+        let Some(listen_port) = self.session.tcp_listen_port() else {
+            return;
+        };
+        let torrents: HashMap<String, Arc<ManagedTorrent>> = self.session.with_torrents(|list| {
+            list.map(|(_, handle)| (handle.shared().info_hash.as_string(), handle.clone()))
+                .collect()
+        });
+
+        let mut seeds = self.seeds.lock().unwrap();
+        for (infohash, entries) in seeds.iter_mut() {
+            // A bridge is only useful while the torrent is live and still
+            // wants data: the session refuses connections for anything that is
+            // not live, and a completed torrent has nothing left to request.
+            let handle = torrents
+                .get(infohash)
+                .filter(|handle| handle.live().is_some() && !handle.stats().finished);
+            for entry in entries.iter_mut() {
+                // A finished task means the bridge gave up on the seed.
+                if entry.task.as_ref().is_some_and(AbortHandle::is_finished) {
+                    entry.task = None;
+                }
+                let failed = entry.status.state() == WebSeedState::Failed;
+                match (&entry.task, handle) {
+                    (None, Some(handle)) if !failed => {
+                        entry.task = self.start_bridge(handle, listen_port, entry);
+                    }
+                    (Some(task), None) => {
+                        task.abort();
+                        entry.task = None;
+                    }
+                    _ => {}
+                }
+                // A seed with no reason to run reads as idle rather than
+                // forever "connecting".
+                if handle.is_none() && !failed {
+                    entry.status.park();
+                }
+            }
+        }
+    }
+
+    /// Spawn a bridge for one seed, or `None` if the torrent's metadata has not
+    /// resolved yet.
+    fn start_bridge(
+        &self,
+        handle: &Arc<ManagedTorrent>,
+        listen_port: u16,
+        entry: &SeedEntry,
+    ) -> Option<AbortHandle> {
+        let concurrency = self.web_seeds.concurrency;
+        let (map, params) = bridge_setup(handle, listen_port, &entry.url, concurrency)?;
+        let status = entry.status.clone();
+        let fetcher = Arc::new(Fetcher::new(
+            map,
+            status.clone(),
+            params.piece_length,
+            concurrency,
+        ));
+        Some(tokio::spawn(webseed::bridge::run(params, fetcher, status)).abort_handle())
+    }
+
+    /// Web seed rows for a torrent's detail pane.
+    fn web_seed_rows(&self, infohash: &str) -> Vec<WebSeedRow> {
+        let seeds = self.seeds.lock().unwrap();
+        seeds
+            .get(infohash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| WebSeedRow {
+                        url: entry.url.clone(),
+                        state: entry.status.state(),
+                        served_bytes: entry.status.served_bytes(),
+                        error: entry.status.error(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Loopback ports the torrent's bridges are connected from.
+    fn web_seed_ports(&self, infohash: &str) -> HashSet<u16> {
+        let seeds = self.seeds.lock().unwrap();
+        seeds
+            .get(infohash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e.status.local_port())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Write the attached seeds to disk.
+    fn persist(&self, seeds: &HashMap<String, Vec<SeedEntry>>) -> Result<()> {
+        let Some(path) = &self.web_seeds.state_path else {
+            return Ok(());
+        };
+        let mut store = SeedStore::default();
+        for (infohash, entries) in seeds {
+            for entry in entries {
+                store.insert(infohash, entry.url.clone());
+            }
+        }
+        webseed::state::save(path, &store)
+    }
+}
+
+/// Build the file map and bridge parameters for one web seed on a torrent.
+///
+/// Returns `None` while the torrent's metadata is still resolving, since the
+/// file layout is what the mapping is built from.
+pub(crate) fn bridge_setup(
+    handle: &ManagedTorrent,
+    listen_port: u16,
+    url: &str,
+    concurrency: usize,
+) -> Option<(FileMap, BridgeParams)> {
+    let shared = handle.shared();
+    let info_hash = shared.info_hash;
+    handle
+        .with_metadata(|metadata| {
+            let name = metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| info_hash.as_string());
+            let files: Vec<TorrentFile> = metadata
+                .file_infos
+                .iter()
+                .map(|file| TorrentFile {
+                    path: file
+                        .relative_filename
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect(),
+                    offset: file.offset_in_torrent,
+                    len: file.len,
+                })
+                .collect();
+            let map = FileMap::new(url, &name, metadata.info.files.is_some(), &files);
+            let params = BridgeParams {
+                listen_port,
+                info_hash,
+                session_peer_id: shared.peer_id,
+                piece_length: metadata.lengths.default_piece_length(),
+                total_pieces: metadata.lengths.total_pieces(),
+                bitfield_bytes: metadata.lengths.piece_bitfield_bytes(),
+                concurrency,
+            };
+            (map, params)
+        })
+        .ok()
+}
+
+/// Load persisted web seeds, dropping any whose torrent is no longer present.
+///
+/// A state file that cannot be read is treated as empty: losing the seed list
+/// is recoverable, refusing to start is not.
+fn restore_web_seeds(
+    session: &Session,
+    settings: &WebSeedSettings,
+) -> (HashMap<String, Vec<SeedEntry>>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut seeds = HashMap::new();
+    if !settings.enabled {
+        return (seeds, warnings);
+    }
+    if session.tcp_listen_port().is_none() {
+        warnings.push("web seeds need an incoming peer port, but none was bound".to_string());
+    }
+    let Some(path) = &settings.state_path else {
+        return (seeds, warnings);
+    };
+
+    let (mut store, error) = webseed::state::load(path);
+    if let Some(error) = error {
+        warnings.push(error);
+    }
+    let known: HashSet<String> = session.with_torrents(|list| {
+        list.map(|(_, handle)| handle.shared().info_hash.as_string())
+            .collect()
+    });
+    store.retain_known(&|infohash| known.contains(infohash));
+    for infohash in store.infohashes() {
+        let entries = store
+            .urls(infohash)
+            .iter()
+            .map(|url| SeedEntry::new(url.clone()))
+            .collect();
+        seeds.insert(infohash.clone(), entries);
+    }
+    (seeds, warnings)
+}
+
+/// Whether a peer address belongs to one of this torrent's bridges.
+fn is_bridge_addr(addr: &str, ports: &HashSet<u16>) -> bool {
+    if ports.is_empty() {
+        return false;
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    if !matches!(host, "127.0.0.1" | "[::1]" | "::1" | "localhost") {
+        return false;
+    }
+    port.parse().is_ok_and(|port| ports.contains(&port))
+}
+
+/// Append a note when the seed list could not be written.
+fn with_save_result(message: &str, saved: Result<()>) -> String {
+    match saved {
+        Ok(()) => message.to_string(),
+        Err(e) => format!("{message} (not saved: {e})"),
     }
 }
 
@@ -393,6 +727,20 @@ pub enum Command {
         /// Upload cap in bytes per second.
         up: Option<u32>,
     },
+    /// Attach an HTTP source to a torrent as a web seed.
+    AttachWebSeed {
+        /// Torrent id.
+        id: usize,
+        /// HTTP or HTTPS URL of the source.
+        url: String,
+    },
+    /// Detach a web seed from a torrent.
+    DetachWebSeed {
+        /// Torrent id.
+        id: usize,
+        /// URL to detach.
+        url: String,
+    },
     /// Begin publishing detail snapshots for the given torrent id.
     FetchDetail(usize),
     /// Stop publishing detail snapshots.
@@ -454,6 +802,14 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     let (status_tx, status_rx) = mpsc::unbounded_channel::<EngineStatus>();
     let (search_tx, search_rx) = mpsc::unbounded_channel::<SearchOutcome>();
     let (preview_tx, preview_rx) = mpsc::unbounded_channel::<PreviewOutcome>();
+
+    for warning in engine.startup_warnings() {
+        let _ = status_tx.send(EngineStatus {
+            message: warning.clone(),
+            is_error: true,
+            finished_add: None,
+        });
+    }
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
@@ -600,6 +956,7 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                 }
                 _ = ticker.tick() => {
                     add_tasks.retain(|_, handle| !handle.is_finished());
+                    engine.reconcile_web_seeds();
                     let _ = snapshot_tx.send(engine.snapshot());
                     if let Some(id) = detail_id {
                         match engine.detail(id) {
@@ -657,6 +1014,8 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             .set_files(id, &included)
             .await
             .map(|_| format!("updated files for torrent {id}")),
+        Command::AttachWebSeed { id, url } => engine.attach_web_seed(id, url),
+        Command::DetachWebSeed { id, url } => engine.detach_web_seed(id, &url),
         // These are handled by the spawn loop, not here.
         Command::AddWithOptions { .. }
         | Command::PreviewAdd(_)

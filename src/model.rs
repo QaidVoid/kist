@@ -157,6 +157,49 @@ pub struct PeerRow {
     pub state: String,
     /// Total payload bytes fetched from this peer.
     pub fetched_bytes: u64,
+    /// Whether this "peer" is one of kist's own web seed bridges rather than a
+    /// member of the swarm.
+    pub web_seed: bool,
+}
+
+/// State of an attached web seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSeedState {
+    /// Attached, but the torrent does not need it: paused, finished, or gone.
+    Idle,
+    /// The torrent needs it, but it is not connected yet.
+    Connecting,
+    /// Connected and available to serve.
+    Active,
+    /// Retrying after a transient HTTP failure.
+    BackingOff,
+    /// Permanently failed; no longer serving.
+    Failed,
+}
+
+impl WebSeedState {
+    /// Lowercase human-readable label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            WebSeedState::Idle => "idle",
+            WebSeedState::Connecting => "connecting",
+            WebSeedState::Active => "active",
+            WebSeedState::BackingOff => "backing off",
+            WebSeedState::Failed => "failed",
+        }
+    }
+}
+
+/// One web seed attached to a torrent, in the detail view.
+#[derive(Debug, Clone)]
+pub struct WebSeedRow {
+    /// The HTTP source URL as the user entered it.
+    pub url: String,
+    pub state: WebSeedState,
+    /// Payload bytes this seed has served to the session.
+    pub served_bytes: u64,
+    /// Why the seed failed, when it has.
+    pub error: Option<String>,
 }
 
 /// A detailed view of a single torrent, fetched on demand for the detail pane.
@@ -183,6 +226,8 @@ pub struct DetailSnapshot {
     pub peer_rows: Vec<PeerRow>,
     /// Tracker announce URLs, sorted.
     pub trackers: Vec<String>,
+    /// Attached web seeds, in the order they were attached.
+    pub web_seeds: Vec<WebSeedRow>,
     /// Per-piece have flags, when available.
     pub pieces: Option<Vec<bool>>,
 }

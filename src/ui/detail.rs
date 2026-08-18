@@ -6,12 +6,12 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-use crate::app::{App, DetailTab, Mode};
+use crate::app::{App, DetailTab};
 use crate::format::{
     format_duration, format_percent, format_ratio, format_size, format_speed, truncate_end,
     truncate_middle,
 };
-use crate::model::DetailSnapshot;
+use crate::model::{DetailSnapshot, WebSeedState};
 use crate::ui::theme;
 
 /// Sparkline glyphs from empty to full (U+2581..U+2588).
@@ -28,7 +28,7 @@ const KEY_WIDTH: usize = 10;
 /// stored scroll offset is clamped to the content here so key handling can
 /// over-shoot freely.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
-    let Mode::Detail { id } = app.mode else {
+    let Some(id) = app.detail_target_id() else {
         return;
     };
 
@@ -90,6 +90,7 @@ fn tab_line(tab: DetailTab) -> Line<'static> {
         DetailTab::Files,
         DetailTab::Peers,
         DetailTab::Trackers,
+        DetailTab::Sources,
     ];
     for (i, t) in tabs.into_iter().enumerate() {
         if i > 0 {
@@ -117,6 +118,7 @@ fn detail_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static
         DetailTab::Files => file_lines(d, app, width),
         DetailTab::Peers => peer_lines(d, app, width),
         DetailTab::Trackers => tracker_lines(d, width),
+        DetailTab::Sources => web_seed_lines(d, app, width),
     }
 }
 
@@ -335,13 +337,23 @@ fn peer_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>>
             Some(bps) => format_speed(*bps),
             None => theme::NONE.to_string(),
         };
-        Line::raw(format!(
+        // A bridge peer is one of kist's own web seeds, not a swarm member, so
+        // say so rather than reporting librqbit's peer state for it.
+        let state = match p.web_seed {
+            true => "web seed",
+            false => &p.state,
+        };
+        let line = Line::raw(format!(
             " {:<addr_budget$}  {:<10}  {:>10}  {:>10}",
             truncate_end(&p.addr, addr_budget),
-            truncate_end(&p.state, 10),
+            truncate_end(state, 10),
             format_size(p.fetched_bytes),
             speed
-        ))
+        ));
+        match p.web_seed {
+            true => line.style(Style::new().fg(theme::WARN)),
+            false => line,
+        }
     }));
     lines
 }
@@ -358,6 +370,57 @@ fn tracker_lines(d: &DetailSnapshot, width: usize) -> Vec<Line<'static>> {
         .iter()
         .map(|t| Line::raw(format!(" {}", truncate_end(t, width.saturating_sub(1)))))
         .collect()
+}
+
+/// Lines for the sources tab: one row per web seed with its state and how much
+/// it has served, plus the reason underneath when it has a problem.
+fn web_seed_lines(d: &DetailSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
+    if d.web_seeds.is_empty() {
+        return vec![Line::from(Span::styled(
+            " No web seeds. Press w to attach an HTTP source.",
+            Style::new().fg(theme::DIM),
+        ))];
+    }
+    let selected = app.detail_seed_selected.min(d.web_seeds.len() - 1);
+    let url_budget = width.saturating_sub(1 + 12 + 2 + 9 + 2).max(12);
+    let mut lines = Vec::with_capacity(d.web_seeds.len());
+    for (i, seed) in d.web_seeds.iter().enumerate() {
+        let mut line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<12}", seed.state.label()),
+                Style::new().fg(seed_color(seed.state)),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>9}", format_size(seed.served_bytes)),
+                Style::new().fg(theme::DIM),
+            ),
+            Span::raw("  "),
+            Span::raw(truncate_middle(&seed.url, url_budget)),
+        ]);
+        if i == selected && app.detail_tab == DetailTab::Sources {
+            line = line.style(Style::new().add_modifier(ratatui::style::Modifier::REVERSED));
+        }
+        lines.push(line);
+        if let Some(error) = &seed.error {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", truncate_end(error, width.saturating_sub(3))),
+                Style::new().fg(theme::ERROR),
+            )));
+        }
+    }
+    lines
+}
+
+/// Theme color for a web seed state.
+fn seed_color(state: WebSeedState) -> ratatui::style::Color {
+    match state {
+        WebSeedState::Active => theme::OK,
+        WebSeedState::Idle | WebSeedState::Connecting => theme::DIM,
+        WebSeedState::BackingOff => theme::WARN,
+        WebSeedState::Failed => theme::ERROR,
+    }
 }
 
 /// A labelled key/value line with a themed key and a plain value.

@@ -34,6 +34,10 @@ pub struct Config {
     /// Global upload speed cap as a human size (e.g. `"512K"`); absent means
     /// unlimited.
     pub upload_limit: Option<String>,
+    /// Whether HTTP web seeds (BEP 19) can be attached to torrents.
+    pub enable_web_seeds: bool,
+    /// Concurrent HTTP requests allowed per web seed.
+    pub web_seed_concurrency: usize,
 }
 
 impl Default for Config {
@@ -46,6 +50,8 @@ impl Default for Config {
             refresh_interval_ms: 250,
             download_limit: None,
             upload_limit: None,
+            enable_web_seeds: true,
+            web_seed_concurrency: 4,
         }
     }
 }
@@ -128,6 +134,11 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// The kist-owned folder for session persistence (under the OS data directory).
 pub fn persistence_directory() -> Result<PathBuf> {
     Ok(project_dirs()?.data_dir().join("session"))
+}
+
+/// The file holding web seeds attached to torrents, beside the session store.
+pub fn web_seed_state_file() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_dir().join("webseeds.json"))
 }
 
 fn project_dirs() -> Result<ProjectDirs> {

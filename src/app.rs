@@ -76,6 +76,7 @@ pub enum DetailTab {
     Files,
     Peers,
     Trackers,
+    Sources,
 }
 
 impl DetailTab {
@@ -85,7 +86,8 @@ impl DetailTab {
             DetailTab::Overview => DetailTab::Files,
             DetailTab::Files => DetailTab::Peers,
             DetailTab::Peers => DetailTab::Trackers,
-            DetailTab::Trackers => DetailTab::Overview,
+            DetailTab::Trackers => DetailTab::Sources,
+            DetailTab::Sources => DetailTab::Overview,
         }
     }
 
@@ -96,6 +98,7 @@ impl DetailTab {
             DetailTab::Files => "files",
             DetailTab::Peers => "peers",
             DetailTab::Trackers => "trackers",
+            DetailTab::Sources => "sources",
         }
     }
 }
@@ -129,6 +132,13 @@ pub enum Mode {
     AddOptionsFolder,
     /// The add-with-options file selection list is open.
     AddOptionsFiles,
+    /// The web seed URL prompt is open for the torrent with this id.
+    WebSeedPrompt {
+        id: usize,
+        /// Whether the prompt was opened from the detail pane, which is where
+        /// it returns to.
+        from_detail: bool,
+    },
 }
 
 /// An add that was dispatched to the engine but has not completed yet, e.g. a
@@ -292,6 +302,8 @@ pub struct App {
     pub detail_tab: DetailTab,
     /// Index of the highlighted file in the detail Files tab.
     pub detail_file_selected: usize,
+    /// Index of the highlighted web seed in the detail Sources tab.
+    pub detail_seed_selected: usize,
     /// Vertical scroll offset, in lines, of the detail pane content.
     pub detail_scroll: u16,
     /// Height of the detail content viewport from the last render, used to size
@@ -317,6 +329,8 @@ pub struct App {
     pub search_loading: bool,
     /// Query the results (or in-flight search) belong to.
     pub search_query: String,
+    /// Whether web seeds are enabled, so `w` can explain itself when they are not.
+    pub web_seeds_enabled: bool,
     /// Active global download cap in bytes per second, if any (for display).
     pub down_limit: Option<u32>,
     /// Active global upload cap in bytes per second, if any (for display).
@@ -350,6 +364,7 @@ impl App {
             detail: None,
             detail_tab: DetailTab::default(),
             detail_file_selected: 0,
+            detail_seed_selected: 0,
             detail_scroll: 0,
             detail_page: 0,
             detail_down_history: VecDeque::new(),
@@ -362,6 +377,7 @@ impl App {
             search_selected: 0,
             search_loading: false,
             search_query: String::new(),
+            web_seeds_enabled: true,
             down_limit: None,
             up_limit: None,
             limits_form: LimitsForm::default(),
@@ -451,10 +467,7 @@ impl App {
     /// Replace the detail snapshot for the pane, feeding the speed history and
     /// per-peer speed buffers (which reset when the target torrent changes).
     pub fn set_detail(&mut self, detail: Option<DetailSnapshot>) {
-        let id = match self.mode {
-            Mode::Detail { id } => Some(id),
-            _ => None,
-        };
+        let id = self.detail_target_id();
         if id != self.history_id {
             self.detail_down_history.clear();
             self.detail_up_history.clear();
@@ -540,6 +553,7 @@ impl App {
                         | Mode::Filter
                         | Mode::AddOptionsSource
                         | Mode::AddOptionsFolder
+                        | Mode::WebSeedPrompt { .. }
                 ) {
                     self.insert_str(&text);
                 }
@@ -567,6 +581,7 @@ impl App {
             Mode::AddOptions => self.handle_add_options_key(key),
             Mode::AddOptionsFolder => self.handle_add_options_folder_key(key),
             Mode::AddOptionsFiles => self.handle_add_options_files_key(key),
+            Mode::WebSeedPrompt { .. } => self.handle_web_seed_key(key),
         }
     }
 
@@ -627,6 +642,7 @@ impl App {
                 self.mode = Mode::SearchInput;
                 Action::none()
             }
+            KeyCode::Char('w') => self.open_web_seed_prompt(),
             KeyCode::Char('s') => {
                 self.cycle_sort(false);
                 Action::none()
@@ -1118,11 +1134,30 @@ impl App {
                 self.detail_tab = self.detail_tab.next();
                 self.detail_scroll = 0;
                 self.detail_file_selected = 0;
+                self.detail_seed_selected = 0;
                 Action::none()
             }
             KeyCode::Char('i') | KeyCode::Esc => {
                 self.mode = Mode::List;
                 Action::cmd(Command::StopDetail)
+            }
+            KeyCode::Char('w') => self.open_web_seed_prompt(),
+            // In the Sources tab, j/k move the seed cursor and d detaches the
+            // highlighted seed. Ctrl+D still scrolls.
+            KeyCode::Up | KeyCode::Char('k') if self.detail_tab == DetailTab::Sources => {
+                self.detail_seed_selected = self.detail_seed_selected.saturating_sub(1);
+                Action::none()
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.detail_tab == DetailTab::Sources => {
+                let last = self.detail_seeds_len().saturating_sub(1);
+                self.detail_seed_selected = (self.detail_seed_selected + 1).min(last);
+                Action::none()
+            }
+            KeyCode::Char('d')
+                if self.detail_tab == DetailTab::Sources
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.detach_selected_web_seed()
             }
             // In the Files tab, j/k move the file cursor; elsewhere they change
             // the torrent the pane is focused on.
@@ -1193,9 +1228,95 @@ impl App {
         }
     }
 
+    /// The torrent the detail pane is showing, including while the web seed
+    /// prompt sits on top of it, so the pane stays visible behind the prompt and
+    /// its speed history is not reset.
+    pub fn detail_target_id(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Detail { id } => Some(id),
+            Mode::WebSeedPrompt {
+                id,
+                from_detail: true,
+            } => Some(id),
+            _ => None,
+        }
+    }
+
     /// Number of files in the current detail snapshot.
     fn detail_files_len(&self) -> usize {
         self.detail.as_ref().map_or(0, |d| d.files.len())
+    }
+
+    /// Number of web seeds in the current detail snapshot.
+    fn detail_seeds_len(&self) -> usize {
+        self.detail.as_ref().map_or(0, |d| d.web_seeds.len())
+    }
+
+    /// Open the web seed prompt for the torrent under the cursor.
+    fn open_web_seed_prompt(&mut self) -> Action {
+        if !self.web_seeds_enabled {
+            self.set_status("web seeds are disabled in the config".to_string(), true);
+            return Action::none();
+        }
+        let from_detail = matches!(self.mode, Mode::Detail { .. });
+        let id = match self.mode {
+            Mode::Detail { id } => Some(id),
+            _ => self.selected_id(),
+        };
+        match id {
+            Some(id) => {
+                self.clear_input();
+                self.mode = Mode::WebSeedPrompt { id, from_detail };
+            }
+            None => self.set_status("no torrent selected".to_string(), true),
+        }
+        Action::none()
+    }
+
+    /// Detach the highlighted web seed in the Sources tab.
+    fn detach_selected_web_seed(&mut self) -> Action {
+        let Mode::Detail { id } = self.mode else {
+            return Action::none();
+        };
+        let Some(detail) = &self.detail else {
+            return Action::none();
+        };
+        match detail.web_seeds.get(self.detail_seed_selected) {
+            Some(seed) => Action::cmd(Command::DetachWebSeed {
+                id,
+                url: seed.url.clone(),
+            }),
+            None => Action::none(),
+        }
+    }
+
+    fn handle_web_seed_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::WebSeedPrompt { id, from_detail } = self.mode else {
+            return Action::none();
+        };
+        // The prompt returns to wherever it was opened from.
+        let back = match from_detail {
+            true => Mode::Detail { id },
+            false => Mode::List,
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_input();
+                self.mode = back;
+                Action::none()
+            }
+            KeyCode::Enter => {
+                let url = self.input.trim().to_string();
+                self.clear_input();
+                self.mode = back;
+                if url.is_empty() {
+                    Action::none()
+                } else {
+                    Action::cmd(Command::AttachWebSeed { id, url })
+                }
+            }
+            _ => self.handle_text_key(key).unwrap_or_else(Action::none),
+        }
     }
 
     /// Toggle inclusion of the highlighted file, keeping at least one file
@@ -1700,6 +1821,7 @@ mod tests {
                 .collect(),
             peer_rows: Vec::new(),
             trackers: Vec::new(),
+            web_seeds: Vec::new(),
             pieces: None,
         }
     }
@@ -1789,6 +1911,137 @@ mod tests {
         a.detail_file_selected = 0;
         let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(action.commands.is_empty());
+    }
+
+    fn detail_with_seeds(id: usize, urls: &[&str]) -> DetailSnapshot {
+        let mut detail = detail_with_files(id, &[true]);
+        detail.web_seeds = urls
+            .iter()
+            .map(|url| crate::model::WebSeedRow {
+                url: url.to_string(),
+                state: crate::model::WebSeedState::Active,
+                served_bytes: 0,
+                error: None,
+            })
+            .collect();
+        detail
+    }
+
+    #[test]
+    fn web_seed_prompt_from_the_list_attaches_to_the_selection() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(4, "alpha", RowState::Live, 0.5, 0)]);
+
+        a.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert_eq!(
+            a.mode,
+            Mode::WebSeedPrompt {
+                id: 4,
+                from_detail: false
+            }
+        );
+
+        type_str(&mut a, "https://example.com/files/");
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        match &action.commands[..] {
+            [Command::AttachWebSeed { id, url }] => {
+                assert_eq!(*id, 4);
+                assert_eq!(url, "https://example.com/files/");
+            }
+            other => panic!("expected AttachWebSeed, got {other:?}"),
+        }
+        // The prompt came from the list, so it returns there.
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn web_seed_prompt_returns_to_the_detail_pane() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(4, "alpha", RowState::Live, 0.5, 0)]);
+        a.mode = Mode::Detail { id: 4 };
+
+        a.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert_eq!(
+            a.mode,
+            Mode::WebSeedPrompt {
+                id: 4,
+                from_detail: true
+            }
+        );
+        a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(a.mode, Mode::Detail { id: 4 });
+    }
+
+    #[test]
+    fn empty_web_seed_url_attaches_nothing() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![row(4, "alpha", RowState::Live, 0.5, 0)]);
+        a.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        let action = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(action.commands.is_empty());
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn web_seed_key_reports_when_disabled() {
+        let mut a = App::new();
+        a.web_seeds_enabled = false;
+        a.snapshot = Snapshot::from_rows(vec![row(4, "alpha", RowState::Live, 0.5, 0)]);
+        a.handle_key(KeyEvent::from(KeyCode::Char('w')));
+        assert_eq!(a.mode, Mode::List, "no prompt opens when disabled");
+        assert!(a.status_is_error);
+        assert!(a.status.as_deref().is_some_and(|s| s.contains("disabled")));
+    }
+
+    #[test]
+    fn sources_tab_detaches_the_highlighted_seed() {
+        let mut a = App::new();
+        a.mode = Mode::Detail { id: 7 };
+        a.detail_tab = DetailTab::Sources;
+        a.detail = Some(detail_with_seeds(
+            7,
+            &["https://a.example/", "https://b.example/"],
+        ));
+
+        a.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(a.detail_seed_selected, 1);
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        match &action.commands[..] {
+            [Command::DetachWebSeed { id, url }] => {
+                assert_eq!(*id, 7);
+                assert_eq!(url, "https://b.example/");
+            }
+            other => panic!("expected DetachWebSeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sources_tab_detach_does_nothing_without_seeds() {
+        let mut a = App::new();
+        a.mode = Mode::Detail { id: 7 };
+        a.detail_tab = DetailTab::Sources;
+        a.detail = Some(detail_with_seeds(7, &[]));
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(action.commands.is_empty());
+    }
+
+    #[test]
+    fn detail_tabs_cycle_through_sources_back_to_overview() {
+        let tabs: Vec<DetailTab> = std::iter::successors(Some(DetailTab::Overview), |t| {
+            Some(t.next()).filter(|next| *next != DetailTab::Overview)
+        })
+        .collect();
+        assert_eq!(
+            tabs,
+            vec![
+                DetailTab::Overview,
+                DetailTab::Files,
+                DetailTab::Peers,
+                DetailTab::Trackers,
+                DetailTab::Sources,
+            ]
+        );
+        assert_eq!(DetailTab::Sources.next(), DetailTab::Overview);
     }
 
     #[test]

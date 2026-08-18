@@ -19,6 +19,7 @@ mod format;
 mod model;
 mod search;
 mod ui;
+mod webseed;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -48,9 +49,17 @@ fn main() -> Result<()> {
 
     let refresh = config.refresh_interval();
     let limits = (config.download_limit_bps(), config.upload_limit_bps());
+    let web_seeds = config.enable_web_seeds;
     let mut terminal =
         ratatui::try_init().map_err(|e| anyhow::anyhow!("failed to initialize terminal: {e}"))?;
-    let ui_result = run_ui(&mut terminal, &mut link, refresh, initial, limits);
+    let ui_result = run_ui(
+        &mut terminal,
+        &mut link,
+        refresh,
+        initial,
+        limits,
+        web_seeds,
+    );
     let _ = ratatui::try_restore();
     ui_result?;
 
@@ -70,11 +79,13 @@ fn run_ui(
     refresh: Duration,
     initial: Option<String>,
     limits: (Option<u32>, Option<u32>),
+    web_seeds: bool,
 ) -> std::io::Result<()> {
     let mut app = App::new();
     app.update_snapshot(link.snapshots.borrow().clone());
     app.down_limit = limits.0;
     app.up_limit = limits.1;
+    app.web_seeds_enabled = web_seeds;
     if let Some(source) = &initial {
         app.push_pending_add(source);
     }

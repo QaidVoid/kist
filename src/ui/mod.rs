@@ -50,7 +50,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas::<4>(area);
 
     render_header(frame, header, app);
-    if let Mode::Detail { .. } = app.mode {
+    if app.detail_target_id().is_some() {
         // Proportional split: compressed list on top, detail pane below.
         let list_height = (main.height * DETAIL_LIST_PERCENT / 100).max(DETAIL_LIST_MIN);
         let [list_area, detail_area] =
@@ -83,6 +83,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             add_bar::render(frame, area, app, " Output folder (blank = default) ")
         }
         Mode::AddOptionsFiles => add_options::render_files(frame, area, app),
+        Mode::WebSeedPrompt { .. } => {
+            add_bar::render(frame, area, app, " Add web seed (http/https URL) ")
+        }
         Mode::Detail { .. } | Mode::List => {}
     }
 }
@@ -274,10 +277,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         Mode::AddOptionsFolder => &[("enter", "set"), ("esc", "back")],
         Mode::AddOptionsFiles => &[("space", "toggle"), ("j/k", "move"), ("enter/esc", "back")],
+        Mode::WebSeedPrompt { .. } => &[("enter", "attach"), ("esc", "cancel")],
+        Mode::Detail { .. } if app.detail_tab == crate::app::DetailTab::Sources => &[
+            ("tab", "cycle"),
+            ("j/k", "move"),
+            ("w", "attach"),
+            ("d", "detach"),
+            ("i/esc", "close"),
+        ],
         Mode::Detail { .. } => &[
             ("tab", "cycle"),
             ("j/k", "move"),
             ("space", "file"),
+            ("w", "web seed"),
             ("^d/^u", "scroll"),
             ("i/esc", "close"),
         ],
@@ -289,6 +301,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("p", "pause"),
             ("r", "resume"),
             ("d", "remove"),
+            ("w", "web seed"),
             ("/", "filter"),
             ("L", "limits"),
             ("s", "sort"),

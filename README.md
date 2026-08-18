@@ -10,7 +10,8 @@ kist keeps things minimal: add a torrent, watch it download, and get out of your
 - Search apibay and download results without leaving the terminal
 - DHT support for magnet links
 - Session persistence, so your torrent list survives restarts
-- Detail pane with overview, files, peers, and trackers tabs
+- Detail pane with overview, files, peers, trackers, and sources tabs
+- Attach an arbitrary HTTP source to any torrent as a web seed (BEP 19)
 - Pause, resume, and remove torrents
 - Filter by name and sort by any column
 - Adaptive layout that hides low-priority columns in narrow terminals
@@ -55,8 +56,10 @@ Press `?` inside kist to see this list at any time.
 | `f` | Search indexers (`enter` downloads the selected result) |
 | `j` / `k` | Move down / up |
 | `i` | Open / close torrent details |
-| `tab` | Cycle detail tab (overview, files, peers, trackers) |
+| `tab` | Cycle detail tab (overview, files, peers, trackers, sources) |
 | `space` | In the files tab, include / exclude the highlighted file |
+| `w` | Attach an HTTP web seed to the selected torrent |
+| `d` | In the sources tab, detach the highlighted web seed |
 | `ctrl+d` / `ctrl+u` | Scroll detail content (also `pgdn` / `pgup`) |
 | `g` / `G` | Detail top / bottom (also `home` / `end`) |
 | `p` / `space` | Pause selected |
@@ -97,9 +100,23 @@ enable_session_persistence = true
 
 # UI refresh interval in milliseconds.
 refresh_interval_ms = 250
+
+# Allow attaching HTTP web seeds to torrents.
+enable_web_seeds = true
+
+# Concurrent HTTP requests allowed per web seed.
+web_seed_concurrency = 4
 ```
 
-Session state is stored under the OS data directory (`~/.local/share/kist/session` on Linux).
+Session state is stored under the OS data directory (`~/.local/share/kist/session` on Linux), and attached web seeds alongside it in `webseeds.json`.
+
+## Web seeds
+
+Press `w` on a torrent to attach an HTTP or HTTPS URL as a web seed, and the sources tab of the detail pane lists what is attached, how much each has served, and why one failed. This works on torrents you have already added, so you can point a stalled download at a mirror of the same content.
+
+kist follows [BEP 19](https://www.bittorrent.org/beps/bep_0019.html) for the URL layout. A single-file torrent uses the URL as given, or appends the torrent name when the URL ends in `/`. A multi-file torrent fetches each file from `<url>/<name>/<path>`. Data arriving over HTTP is hash-checked exactly like data from the swarm, so a bad mirror costs you a refetch and nothing more.
+
+Because librqbit has no web seed support of its own, kist runs each seed as a loopback BitTorrent peer that answers piece requests with ranged HTTP GETs. This means web seeds need the incoming peer port to bind successfully, and a seed shows up in the peers tab labelled `web seed`.
 
 ## License
 

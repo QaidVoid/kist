@@ -1434,10 +1434,13 @@ name = "kist"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "crossterm",
  "directories",
  "librqbit",
+ "librqbit-core",
+ "librqbit-peer-protocol",
  "ratatui",
  "reqwest",
  "serde",
