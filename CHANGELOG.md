@@ -1,4 +1,21 @@
 
+## [0.2.0](https://github.com/QaidVoid/kist/compare/v0.1.0...v0.2.0) - 2026-08-19
+
+### ⛰️  Features
+
+- Redesign the tui for clarity and bulk actions - ([e74576a](https://github.com/QaidVoid/kist/commit/e74576aa5126964f93c3e77d219f25a9d7739da3))
+- Add http web seeds via a loopback peer bridge - ([67f36e6](https://github.com/QaidVoid/kist/commit/67f36e6679398ac5371a658d1e6aae60c813e920))
+- Add rate limits, file selection, and add options - ([62614c8](https://github.com/QaidVoid/kist/commit/62614c8010671d1801e4de930cf420b8d2f75abb))
+- Show and cancel torrents resolving metadata - ([e086098](https://github.com/QaidVoid/kist/commit/e0860985240e77e1b9511958bee77e902353b7f1))
+- Add torrent search and download via public indexers - ([78c4f67](https://github.com/QaidVoid/kist/commit/78c4f67b78ae663519dbb7fbff90d741375aeace))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump actions off the deprecated node 20 runtime - ([1bdd5e6](https://github.com/QaidVoid/kist/commit/1bdd5e6f8c99c0caf60fbe067bf4c536bb71bc52))
+- Build x86_64 windows binaries on release - ([e4a7f88](https://github.com/QaidVoid/kist/commit/e4a7f88150e0f541090fa52a784973fcb79f11b5))
+- Upgrade to librqbit 9 - ([a5d79a8](https://github.com/QaidVoid/kist/commit/a5d79a8c71a0a852257fadc46d3998626b49b197))
+- Optimize release - ([f28e285](https://github.com/QaidVoid/kist/commit/f28e285c657ec0d73c7460e72378671b311775cb))
+
 ## [0.1.0](https://github.com/QaidVoid/kist/compare/v0.0.0...v0.1.0) - 2026-07-15
 
 ### ⛰️  Features
