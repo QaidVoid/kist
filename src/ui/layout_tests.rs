@@ -1,11 +1,12 @@
 //! Layout assertions covering every mode at the sizes the UI claims to support.
 
 use super::harness::{self, assert_within_width, render_to_text, sizes};
-use crate::app::{App, DetailTab, Mode};
+use crate::app::{AddOptionsState, App, DetailTab, Mode, PreviewFileState};
 use crate::model::{
     AggregateStats, DetailFile, DetailSnapshot, PeerRow, RowState, Snapshot, TorrentRow,
     WebSeedRow, WebSeedState,
 };
+use crate::search::SearchResult;
 
 /// A torrent row with deliberately awkward values: a long name, and a size and
 /// speed in the four-digit range that produces the widest formatted strings.
@@ -88,6 +89,24 @@ fn detail() -> DetailSnapshot {
 /// A named mode paired with a builder for the state it needs to render.
 type ModeCase = (&'static str, Box<dyn Fn() -> App>);
 
+/// Add-options state with a previewed file list, as after a successful preview.
+fn add_options_state() -> AddOptionsState {
+    AddOptionsState {
+        source: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string(),
+        paused: false,
+        output_folder: String::new(),
+        files: (0..6)
+            .map(|i| PreviewFileState {
+                name: format!("subdir with spaces/file number {i} with a long name.bin"),
+                size: 1024 * 1000,
+                included: i % 2 == 0,
+            })
+            .collect(),
+        file_selected: 0,
+        preview_loading: false,
+    }
+}
+
 /// Every mode, with whatever state that mode needs to render meaningfully.
 fn modes() -> Vec<ModeCase> {
     vec![
@@ -117,6 +136,24 @@ fn modes() -> Vec<ModeCase> {
                 let mut app = populated();
                 app.mode = Mode::AddBar;
                 app.input = "magnet:?xt=urn:btih:".repeat(6);
+                app
+            }),
+        ),
+        (
+            "add options",
+            Box::new(|| {
+                let mut app = populated();
+                app.mode = Mode::AddOptions;
+                app.add_options = Some(add_options_state());
+                app
+            }),
+        ),
+        (
+            "add options files",
+            Box::new(|| {
+                let mut app = populated();
+                app.mode = Mode::AddOptionsFiles;
+                app.add_options = Some(add_options_state());
                 app
             }),
         ),
@@ -549,5 +586,81 @@ fn minimum_size_still_renders_the_list() {
     assert!(
         !text.contains("too small"),
         "the minimum supported size must render the real layout"
+    );
+}
+
+#[test]
+fn a_status_message_is_visible_under_an_overlay() {
+    let mut app = populated();
+    app.set_status("removed torrent 3".to_string(), true);
+    app.mode = Mode::Help;
+    let text = render_to_text(&mut app, harness::NARROW);
+    assert!(
+        text.contains("removed torrent 3"),
+        "a transient message must show while an overlay is open:\n{text}"
+    );
+}
+
+#[test]
+fn a_status_message_survives_even_full_height_overlays() {
+    // These overlays grow with their content (or ask for a fixed height) and
+    // can cover the whole screen on a short terminal; the bottom row must
+    // stay the status line's.
+    for (name, mode) in [
+        ("help", Mode::Help),
+        ("palette", Mode::Palette),
+        ("add options", Mode::AddOptions),
+        ("add options files", Mode::AddOptionsFiles),
+    ] {
+        let mut app = populated();
+        app.set_status("removed torrent 3".to_string(), true);
+        app.mode = mode;
+        if matches!(mode, Mode::AddOptions | Mode::AddOptionsFiles) {
+            app.add_options = Some(add_options_state());
+        }
+        let text = render_to_text(&mut app, harness::MIN);
+        assert!(
+            text.contains("removed torrent 3"),
+            "{name} must not cover the status row at the minimum size:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn the_help_dismiss_hint_survives_the_minimum_size() {
+    // The trim budget must account for the border and the reserved status
+    // row, so the hint stays inside the popup instead of being clipped off.
+    let mut app = populated();
+    app.mode = Mode::Help;
+    let text = render_to_text(&mut app, harness::MIN);
+    let rows: Vec<&str> = text.lines().collect();
+    // The hint is the popup's last inner line: above the bottom border, which
+    // is itself above the status row.
+    let hint_row = rows[rows.len() - 3];
+    assert!(
+        hint_row.contains("esc"),
+        "the dismiss hint must survive inside the popup at the minimum size:\n{text}"
+    );
+}
+
+#[test]
+fn search_results_show_the_widest_size_unclipped() {
+    // 1000 KiB formats to "1000.0 KiB", the widest string the size formatter
+    // can produce; the Size column must reserve room for it.
+    let mut app = populated();
+    app.mode = Mode::SearchResults;
+    app.search_query = "widest".to_string();
+    app.search_results = vec![SearchResult {
+        title: "a result".to_string(),
+        size: 1000 * 1024,
+        seeders: 3,
+        leechers: 1,
+        source: "example",
+        magnet: "magnet:?xt=urn:btih:abc".to_string(),
+    }];
+    let text = render_to_text(&mut app, harness::NARROW);
+    assert!(
+        text.contains("1000.0 KiB"),
+        "the widest size string must render in full:\n{text}"
     );
 }

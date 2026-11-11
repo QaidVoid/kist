@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::commands::{CommandId, CommandSpec};
 use crate::engine::{Command, PreviewOutcome};
@@ -775,12 +775,16 @@ impl App {
         match event {
             Event::Tick => Action::none(),
             // Any key clears a transient status, then is processed normally.
-            Event::Input(CrosstermEvent::Key(key)) => {
+            // Only presses act: Windows reports key-up as a release event, and
+            // acting on it would fire every key a second time.
+            Event::Input(CrosstermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                 if self.status.is_some() {
                     self.clear_status();
                 }
                 self.handle_key(key)
             }
+            // A non-press key event is ignored entirely, side effects included.
+            Event::Input(CrosstermEvent::Key(_)) => Action::none(),
             Event::Input(CrosstermEvent::Paste(text)) => {
                 // A bracketed paste: insert the whole string at the cursor.
                 if matches!(
@@ -2449,5 +2453,38 @@ mod tests {
         }
         assert_eq!(a.pending_adds.len(), 1);
         assert_eq!(a.mode, Mode::List);
+    }
+
+    fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
+        Event::Input(CrosstermEvent::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: crossterm::event::KeyEventState::NONE,
+        }))
+    }
+
+    #[test]
+    fn release_events_are_ignored_entirely() {
+        let mut a = App::new();
+        a.set_status("working".to_string(), false);
+        // 'q' quits on a press; its release must do nothing at all, not even
+        // clear the transient status.
+        let action = a.handle(key_event(KeyCode::Char('q'), KeyEventKind::Release));
+        assert!(!action.quit);
+        assert_eq!(a.status.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn press_events_clear_status_and_process() {
+        let mut a = App::new();
+        a.snapshot = Snapshot::from_rows(vec![
+            row(0, "alpha", RowState::Live, 0.5, 10),
+            row(1, "bravo", RowState::Live, 0.5, 10),
+        ]);
+        a.set_status("working".to_string(), false);
+        a.handle(key_event(KeyCode::Char('j'), KeyEventKind::Press));
+        assert!(a.status.is_none());
+        assert_eq!(a.selected, 1, "the press must process, not just clear");
     }
 }

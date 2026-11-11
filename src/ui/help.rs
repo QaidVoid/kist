@@ -41,8 +41,10 @@ pub fn render(frame: &mut Frame, area: Rect) {
     lines.push(theme::dismiss_hint("esc", "close"));
 
     // Trim from the top rather than letting the bottom fall off the screen:
-    // the dismissal hint is the one line that must always survive.
-    let max_inner = area.height.saturating_sub(2) as usize;
+    // the dismissal hint is the one line that must always survive. The popup
+    // is capped one row above the terminal bottom (the status row) and the
+    // border takes two more, so the inner budget is height minus three.
+    let max_inner = area.height.saturating_sub(3) as usize;
     while lines.len() > max_inner && lines.len() > 1 {
         lines.remove(0);
     }
@@ -55,7 +57,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         .max()
         .unwrap_or(20) as u16;
     let width = widest.min(area.width.saturating_sub(2));
-    let height = (lines.len() as u16 + 2).min(area.height);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(1).max(1));
     let popup = centered_fixed(width, height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(

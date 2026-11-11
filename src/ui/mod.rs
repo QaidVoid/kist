@@ -256,13 +256,9 @@ fn state_counts(stats: &crate::model::AggregateStats) -> Option<String> {
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let budget = area.width.saturating_sub(1) as usize;
 
-    // While an overlay is open its own keys are the only ones that apply, so
-    // the row belongs to it rather than to whatever is selected behind it.
-    if !matches!(app.mode, Mode::List | Mode::Detail { .. }) {
-        render_hints(frame, area, app);
-        return;
-    }
-
+    // A transient message wins in every mode, overlays included: it is how the
+    // app says what just happened, and hiding it while an overlay is open
+    // would make actions issued there report nowhere.
     if let Some(message) = &app.status {
         let style = match app.status_is_error {
             true => theme::danger(),
@@ -273,6 +269,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             style,
         ));
         frame.render_widget(line, area);
+        return;
+    }
+
+    // While an overlay is open its own keys are the only ones that apply, so
+    // the row belongs to it rather than to whatever is selected behind it.
+    if !matches!(app.mode, Mode::List | Mode::Detail { .. }) {
+        render_hints(frame, area, app);
         return;
     }
 
@@ -461,7 +464,9 @@ fn list_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// clamped to the frame.
 pub(super) fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let width = (area.width.saturating_mul(percent_x) / 100).max(1);
-    let height = height.min(area.height).max(1);
+    // One row less than the terminal: the bottom row always stays free for
+    // the status line, whatever an overlay asks for.
+    let height = height.min(area.height.saturating_sub(1)).max(1);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + area.height.saturating_sub(height) / 3;
     Rect::new(x, y, width, height)

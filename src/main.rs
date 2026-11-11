@@ -22,7 +22,22 @@ mod search;
 mod ui;
 mod webseed;
 
+/// Build the panic hook: restore the terminal, then delegate to `previous`.
+/// Restore runs before the delegation so the report prints into the normal
+/// buffer; it is best effort because the hook also fires for panics with no
+/// alternate screen active, where a failed restore is harmless.
+fn panic_hook(
+    previous: Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>,
+) -> Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> {
+    Box::new(move |info| {
+        let _ = ratatui::try_restore();
+        previous(info)
+    })
+}
+
 fn main() -> Result<()> {
+    std::panic::set_hook(panic_hook(std::panic::take_hook()));
+
     let cli = Cli::parse();
     let config_path = cli.config_path()?;
     let mut config = config::load_or_init(&config_path)?;
@@ -108,12 +123,11 @@ fn run_ui(
         }
 
         // Drain engine status messages.
+        let mut batch = Vec::new();
         while let Ok(status) = link.status.try_recv() {
-            if let Some(source) = &status.finished_add {
-                app.finish_pending_add(source);
-            }
-            app.set_status(status.message, status.is_error);
+            batch.push(status);
         }
+        apply_status_batch(&mut app, &batch);
 
         // Drain finished searches.
         while let Ok(outcome) = link.search.try_recv() {
@@ -145,5 +159,103 @@ fn run_ui(
 fn apply_action(action: &Action, commands: &tokio::sync::mpsc::Sender<Command>) {
     for command in &action.commands {
         let _ = commands.try_send(command.clone());
+    }
+}
+
+/// The message a batch of engine statuses collapses into: the last error if
+/// one arrived, otherwise the last message.
+fn last_error_or_last(batch: &[engine::EngineStatus]) -> Option<&engine::EngineStatus> {
+    batch
+        .iter()
+        .rev()
+        .find(|s| s.is_error)
+        .or_else(|| batch.last())
+}
+
+/// Apply a drained batch of engine statuses: every pending add finishes, and
+/// the line shows the batch's last error if there was one, else its last
+/// message, so a success cannot mask an error from the same frame.
+fn apply_status_batch(app: &mut App, batch: &[engine::EngineStatus]) {
+    for status in batch {
+        if let Some(source) = &status.finished_add {
+            app.finish_pending_add(source);
+        }
+    }
+    if let Some(status) = last_error_or_last(batch) {
+        app.set_status(status.message.clone(), status.is_error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineStatus;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn status(message: &str, is_error: bool) -> EngineStatus {
+        EngineStatus {
+            message: message.to_string(),
+            is_error,
+            finished_add: None,
+        }
+    }
+
+    #[test]
+    fn an_error_survives_later_successes_in_a_batch() {
+        let batch = vec![
+            status("added one", false),
+            status("torrent gone", true),
+            status("added two", false),
+        ];
+        assert_eq!(last_error_or_last(&batch).unwrap().message, "torrent gone");
+
+        // Without an error the last message wins, and an empty batch shows
+        // nothing at all.
+        assert_eq!(
+            last_error_or_last(&[status("added one", false)])
+                .unwrap()
+                .message,
+            "added one"
+        );
+        assert!(last_error_or_last(&[]).is_none());
+    }
+
+    #[test]
+    fn a_batch_finishes_adds_and_shows_the_last_error() {
+        let mut a = App::new();
+        a.push_pending_add("magnet:?xt=urn:btih:abc");
+        let batch = vec![
+            status("added one", false),
+            EngineStatus {
+                message: "torrent gone".to_string(),
+                is_error: true,
+                finished_add: Some("magnet:?xt=urn:btih:abc".to_string()),
+            },
+            status("added two", false),
+        ];
+
+        apply_status_batch(&mut a, &batch);
+
+        assert!(a.pending_adds.is_empty(), "every finished_add must apply");
+        assert_eq!(a.status.as_deref(), Some("torrent gone"));
+        assert!(a.status_is_error);
+    }
+
+    #[test]
+    fn panic_hook_restores_and_delegates() {
+        let called = Arc::new(AtomicBool::new(false));
+        let previous_called = called.clone();
+        let previous = Box::new(move |_info: &std::panic::PanicHookInfo<'_>| {
+            previous_called.store(true, Ordering::SeqCst);
+        }) as Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+
+        std::panic::set_hook(panic_hook(previous));
+
+        // With no alternate screen active the restore attempt is a harmless
+        // error, and the previous hook must still run.
+        let result = std::panic::catch_unwind(|| panic!("boom"));
+        assert!(result.is_err());
+        assert!(called.load(Ordering::SeqCst), "previous hook must run");
     }
 }

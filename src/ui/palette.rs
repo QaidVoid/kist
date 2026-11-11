@@ -20,10 +20,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let entries = app.palette_entries();
     let selected = app.palette_selected.min(entries.len().saturating_sub(1));
 
-    // Scroll the window rather than the whole list, so the highlight stays put.
-    let visible = entries.len().min(MAX_ROWS);
+    // Scroll the window rather than the whole list, so the highlight stays
+    // put. The window also shrinks for the query, the dismiss hint, the two
+    // border rows, and the reserved status row, so the hint never clips.
+    let max_visible = area.height.saturating_sub(5).max(1) as usize;
+    let visible = entries.len().min(MAX_ROWS).min(max_visible);
     let first = selected.saturating_sub(visible.saturating_sub(1));
 
+    // centered_rect leaves the bottom row free for the status line.
     let height = (visible as u16 + 4).min(area.height);
     let popup = centered_rect(60, height, area);
     frame.render_widget(Clear, popup);

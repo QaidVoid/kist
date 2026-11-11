@@ -93,7 +93,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 /// Center a popup within `area`, clamped to the frame.
 fn centered(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width).max(1);
-    let height = height.min(area.height).max(1);
+    // One row less than the terminal: the bottom row always stays free for
+    // the status line, whatever the dialog asks for.
+    let height = height.min(area.height.saturating_sub(1)).max(1);
     let x = area.x + (area.width - width) / 2;
     let y = area.y + (area.height - height) / 3;
     Rect::new(x, y, width, height)

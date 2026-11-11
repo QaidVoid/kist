@@ -12,8 +12,10 @@ use crate::ui::{centered_rect, theme};
 /// Gap ratatui inserts between table columns.
 const COLUMN_SPACING: u16 = 1;
 
-/// Fixed (non-Name) column widths: Size, Seeds, Leech, Source.
-const FIXED_COLS: [u16; 4] = [9, 6, 6, 6];
+/// Fixed (non-Name) column widths: Size, Seeds, Leech, Source. The Size column
+/// derives from the formatter's maximum, the same rule the torrent list
+/// follows, so no formatted size can clip.
+const FIXED_COLS: [u16; 4] = [crate::format::SIZE_MAX_WIDTH as u16, 6, 6, 6];
 
 /// Render the search query prompt as a centered single-line input.
 pub fn render_input(frame: &mut Frame, area: Rect, app: &App) {
