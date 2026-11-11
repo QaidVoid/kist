@@ -16,7 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::model::WebSeedState;
 use crate::webseed::SeedStatus;
-use crate::webseed::fetch::Fetcher;
+use crate::webseed::fetch::{FetchError, Fetcher};
+use crate::webseed::mapping::{FileMap, TorrentFile};
 
 /// How a stub server answers requests, so failure paths can be exercised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,8 @@ enum ServeMode {
     IgnoreRange,
     /// Answer everything with `404`.
     NotFound,
+    /// Answer every request with `500`.
+    ServerError,
     /// Honor `Range` but return the wrong bytes.
     Corrupt,
 }
@@ -134,6 +137,9 @@ async fn handle_request(
         .and_then(parse_range);
 
     let path = root.join(percent_decode(target.trim_start_matches('/')));
+    if mode == ServeMode::ServerError {
+        return respond(&mut stream, 500, "Internal Server Error", None, b"error").await;
+    }
     let Ok(body) = std::fs::read(&path) else {
         return respond(&mut stream, 404, "Not Found", None, b"missing").await;
     };
@@ -538,5 +544,110 @@ async fn corrupt_web_seed_data_never_completes_the_torrent() {
         handle.stats().progress_bytes,
         0,
         "no corrupt piece should have been counted as progress"
+    );
+}
+
+/// A single-file [`FileMap`] over the stub server, for fetcher-level tests
+/// that need no session.
+fn fetcher_map(base: &str, len: u64) -> FileMap {
+    FileMap::new(
+        base,
+        "movie.bin",
+        false,
+        &[TorrentFile {
+            path: vec!["movie.bin".to_string()],
+            offset: 0,
+            len,
+        }],
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_transient_attempts_classify_as_transient() {
+    let served = TempDir::new("src-500");
+    let data = content(200 * 1024, 23);
+    std::fs::write(served.path().join("movie.bin"), &data).unwrap();
+
+    let base = serve(served.path().to_path_buf(), ServeMode::ServerError).await;
+    let status = Arc::new(SeedStatus::default());
+    let fetcher = Fetcher::new(
+        fetcher_map(&base, data.len() as u64),
+        status.clone(),
+        32 * 1024,
+        4,
+    );
+
+    // Every attempt fails with 500, so the retries run out; the outcome must
+    // still say transient, which is what keeps the seed reconnecting.
+    match fetcher.read(0, 16 * 1024).await {
+        Err(FetchError::Transient(m)) => assert!(
+            m.contains("gave up after"),
+            "the gave-up reason should be carried, got {m}"
+        ),
+        other => panic!("expected a transient gave-up error, got {other:?}"),
+    }
+    assert_eq!(status.state(), WebSeedState::BackingOff);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_definitive_error_classifies_as_hard() {
+    let served = TempDir::new("src-404-fetch");
+    let data = content(100 * 1024, 29);
+    std::fs::write(served.path().join("movie.bin"), &data).unwrap();
+
+    let base = serve(served.path().to_path_buf(), ServeMode::NotFound).await;
+    let status = Arc::new(SeedStatus::default());
+    let fetcher = Fetcher::new(
+        fetcher_map(&base, data.len() as u64),
+        status.clone(),
+        32 * 1024,
+        4,
+    );
+
+    // A 404 is definitive: no retry, straight to the hard variant.
+    match fetcher.read(0, 16 * 1024).await {
+        Err(FetchError::Hard(m)) => assert!(
+            m.contains("404"),
+            "the failing status should be named, got {m}"
+        ),
+        other => panic!("expected a hard error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_keeps_erroring_reconnects_instead_of_failing() {
+    let served = TempDir::new("src-500-bridge");
+    let data = content(200 * 1024, 31);
+    std::fs::write(served.path().join("movie.bin"), &data).unwrap();
+
+    let base = serve(served.path().to_path_buf(), ServeMode::ServerError).await;
+    let out = TempDir::new("out-500-bridge");
+    let status = Arc::new(SeedStatus::default());
+    let (_session, handle) = attach(
+        &served.path().join("movie.bin"),
+        out.path(),
+        &base,
+        status.clone(),
+    )
+    .await;
+
+    // Once the retries run out, the error is noted and the bridge reconnects;
+    // a seed that only ever 500s must never be marked failed.
+    let noted = wait_for(Duration::from_secs(20), || {
+        status.error().is_some_and(|e| e.contains("gave up"))
+    })
+    .await;
+    assert!(
+        noted,
+        "exhausted transient attempts must surface as a noted error"
+    );
+    assert_ne!(
+        status.state(),
+        WebSeedState::Failed,
+        "transient exhaustion must not fail the seed"
+    );
+    assert!(
+        !handle.stats().finished,
+        "nothing should have completed from a broken seed"
     );
 }

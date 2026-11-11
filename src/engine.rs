@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,6 +57,39 @@ struct WebSeedSettings {
     state_path: Option<PathBuf>,
 }
 
+/// Quarantine a session state file kist cannot parse, before librqbit's own
+/// persistence reads it.
+///
+/// A missing or cleanly parsing file is left untouched and yields `None`; any
+/// other read or parse failure renames the file (never deletes it) to
+/// `session.json.corrupt-<unix seconds>` and yields a startup warning naming
+/// where it went, so a corrupt torrent list cannot keep kist from starting
+/// while nothing is lost.
+fn quarantine_corrupt_state(folder: &Path) -> Option<String> {
+    let state = folder.join("session.json");
+    match std::fs::read(&state) {
+        // The normal fresh-install case librqbit already handles.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Ok(bytes) => {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_ok() {
+                return None;
+            }
+        }
+        // Unreadable counts as corrupt: the session would fail on it too.
+        Err(_) => {}
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let quarantined = folder.join(format!("session.json.corrupt-{stamp}"));
+    std::fs::rename(&state, &quarantined).ok()?;
+    Some(format!(
+        "the session state file was unreadable and was moved to {}",
+        quarantined.display()
+    ))
+}
+
 /// One web seed attached to a torrent, with its bridge task if it is running.
 struct SeedEntry {
     url: String,
@@ -81,6 +114,16 @@ impl Engine {
     /// invalid or unwritable download directory).
     pub async fn new(config: &Config) -> Result<Self> {
         let (listen_addr, listen_warning) = resolve_listen_addr(config.listen_port_range());
+        let mut quarantine_warning = None;
+        let persistence = if config.enable_session_persistence {
+            let folder = crate::config::persistence_directory().ok();
+            // librqbit only tolerates a missing state file, so an unparsable
+            // one would abort startup; move it aside first.
+            quarantine_warning = folder.as_deref().and_then(quarantine_corrupt_state);
+            Some(SessionPersistenceConfig::Json { folder })
+        } else {
+            None
+        };
         let opts = SessionOptions {
             dht: config.enable_dht.then(DhtSessionConfig::default),
             listen: Some(ListenerOptions {
@@ -89,13 +132,7 @@ impl Engine {
             }),
             // Persist the torrent list so it survives restarts, in a kist-owned
             // folder (falling back to librqbit's default if the dir is unknown).
-            persistence: if config.enable_session_persistence {
-                Some(SessionPersistenceConfig::Json {
-                    folder: crate::config::persistence_directory().ok(),
-                })
-            } else {
-                None
-            },
+            persistence,
             ratelimits: LimitsConfig {
                 download_bps: config.download_limit_bps().and_then(NonZeroU32::new),
                 upload_bps: config.upload_limit_bps().and_then(NonZeroU32::new),
@@ -114,6 +151,7 @@ impl Engine {
         };
         let (seeds, mut startup_warnings) = restore_web_seeds(&session, &web_seeds);
         startup_warnings.extend(listen_warning);
+        startup_warnings.extend(quarantine_warning);
 
         Ok(Self {
             session,
@@ -1167,6 +1205,32 @@ mod tests {
     use super::*;
     use librqbit::Magnet;
 
+    /// A unique temp directory removed when the test ends.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("kist-engine-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn add_status_reports_each_outcome_honestly() {
         assert_eq!(add_status(AddOutcome::Added, false).0, "added torrent");
@@ -1183,6 +1247,62 @@ mod tests {
         assert!(is_error);
         assert!(message.contains("already in list"));
         assert!(message.contains("not applied"));
+    }
+
+    #[test]
+    fn a_corrupt_session_state_file_is_quarantined() {
+        let dir = TempDir::new("quarantine-corrupt");
+        std::fs::write(dir.path().join("session.json"), b"not json at all {").unwrap();
+
+        let warning = quarantine_corrupt_state(dir.path()).expect("corrupt state must quarantine");
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("session.json.corrupt-")),
+            "the file must be kept, only renamed: {entries:?}"
+        );
+        assert!(
+            !entries.contains(&"session.json".to_string()),
+            "the unparsable file must not stay in place: {entries:?}"
+        );
+        let quarantined = dir.path().join(
+            entries
+                .iter()
+                .find(|n| n.starts_with("session.json.corrupt-"))
+                .unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(&quarantined).unwrap(),
+            b"not json at all {",
+            "nothing may be lost"
+        );
+        assert!(
+            warning.contains(&*quarantined.file_name().unwrap().to_string_lossy()),
+            "the warning must name the quarantined path, got {warning:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_session_state_file_is_untouched() {
+        let dir = TempDir::new("quarantine-missing");
+        assert!(quarantine_corrupt_state(dir.path()).is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_valid_session_state_file_is_untouched() {
+        let dir = TempDir::new("quarantine-valid");
+        std::fs::write(dir.path().join("session.json"), br#"{"torrents": []}"#).unwrap();
+        assert!(quarantine_corrupt_state(dir.path()).is_none());
+        assert!(
+            dir.path().join("session.json").exists(),
+            "a parseable file must be handed over untouched"
+        );
     }
 
     #[test]

@@ -144,7 +144,7 @@ async fn serve(
     let pending: Arc<Mutex<HashSet<BlockKey>>> = Arc::default();
     let limiter = Arc::new(Semaphore::new(params.concurrency.max(1)));
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<(), FetchError>> = JoinSet::new();
     let mut keep_alive = tokio::time::interval(KEEP_ALIVE_INTERVAL);
 
     loop {
@@ -200,7 +200,15 @@ async fn serve(
             Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
                 match finished {
                     Ok(Ok(())) => {}
-                    Ok(Err(reason)) => return Err(BridgeError::Seed(reason)),
+                    // A definitive fetch error means the seed is done; a
+                    // transient one (including exhausted retries) reconnects
+                    // like any other connection loss.
+                    Ok(Err(e)) => {
+                        return Err(match e {
+                            FetchError::Hard(reason) => BridgeError::Seed(reason),
+                            FetchError::Transient(reason) => BridgeError::Link(reason),
+                        });
+                    }
                     Err(e) if e.is_panic() => {
                         return Err(BridgeError::Seed(format!("bridge task panicked: {e}")));
                     }
@@ -313,15 +321,13 @@ async fn serve_block(
     status: Arc<SeedStatus>,
     pending: Arc<Mutex<HashSet<BlockKey>>>,
     out: mpsc::Sender<Vec<u8>>,
-) -> Result<(), String> {
+) -> Result<(), FetchError> {
     let (index, begin, length) = key;
-    let _permit = limiter.acquire().await.map_err(|e| e.to_string())?;
-    let block = match fetcher.read(offset, u64::from(length)).await {
-        Ok(block) => block,
-        // The fetcher already retried transient failures, so anything surfacing
-        // here means the seed is done.
-        Err(FetchError::Hard(reason) | FetchError::Transient(reason)) => return Err(reason),
-    };
+    let _permit = limiter
+        .acquire()
+        .await
+        .map_err(|e| FetchError::Transient(e.to_string()))?;
+    let block = fetcher.read(offset, u64::from(length)).await?;
 
     if !pending.lock().unwrap().remove(&key) {
         return Ok(());
@@ -329,7 +335,8 @@ async fn serve_block(
 
     let message = Message::Piece(Piece::from_data(index, begin, &block));
     let buf = serialize(&message, block.len()).map_err(|e| match e {
-        BridgeError::Seed(reason) | BridgeError::Link(reason) => reason,
+        BridgeError::Seed(reason) => FetchError::Hard(reason),
+        BridgeError::Link(reason) => FetchError::Transient(reason),
     })?;
     status.add_served(block.len() as u64);
     let _ = out.send(buf).await;

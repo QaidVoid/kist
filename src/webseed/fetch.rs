@@ -98,7 +98,9 @@ impl Fetcher {
     /// with exponential backoff.
     ///
     /// The seed's state follows the outcome: backing off while retrying, active
-    /// once a read succeeds.
+    /// once a read succeeds. Exhaustion of transient attempts is reported as
+    /// transient too, so the seed reconnects later rather than being marked
+    /// failed; only definitive errors surface as hard.
     pub async fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, FetchError> {
         let mut backoff = BACKOFF_BASE;
         let mut last = String::new();
@@ -117,7 +119,7 @@ impl Fetcher {
                 Err(FetchError::Transient(m)) => last = m,
             }
         }
-        Err(FetchError::Hard(format!(
+        Err(FetchError::Transient(format!(
             "gave up after {MAX_ATTEMPTS} attempts: {last}"
         )))
     }
