@@ -62,12 +62,13 @@ impl Config {
         Duration::from_millis(self.refresh_interval_ms.max(50))
     }
 
-    /// Build the librqbit listen port range as a half-open `start..end`,
-    /// normalized so `end >= start` and the upper bound is inclusive-friendly.
-    pub fn listen_port_range(&self) -> std::ops::Range<u16> {
-        let start = self.listen_ports[0];
-        let end = self.listen_ports[1].max(start);
-        start..end.saturating_add(1)
+    /// Build the librqbit listen port range. Bounds given in either order are
+    /// normalized, so every port between and including both is eligible, and
+    /// an upper bound of 65535 keeps that port usable instead of saturating
+    /// away the last port.
+    pub fn listen_port_range(&self) -> std::ops::RangeInclusive<u16> {
+        let (a, b) = (self.listen_ports[0], self.listen_ports[1]);
+        (a.min(b))..=(a.max(b))
     }
 
     /// Configured global download cap in bytes per second, if any. An
@@ -247,5 +248,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listen_port_range_keeps_the_inclusive_end() {
+        let config = Config {
+            listen_ports: [6881, 65535],
+            ..Default::default()
+        };
+        let range = config.listen_port_range();
+        assert_eq!(range, 6881..=65535);
+        assert!(range.contains(&65535), "65535 must stay usable");
+    }
+
+    #[test]
+    fn listen_port_range_normalizes_reversed_bounds() {
+        let config = Config {
+            listen_ports: [7000, 6881],
+            ..Default::default()
+        };
+        assert_eq!(config.listen_port_range(), 6881..=7000);
     }
 }

@@ -160,7 +160,9 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
 /// Accepts a decimal number with an optional binary unit suffix `K`, `M`, or
 /// `G` (case-insensitive, meaning KiB, MiB, GiB); a bare number is bytes per
 /// second. An empty string or a lone `-` means unlimited and yields `None`, as
-/// does any value that cannot be parsed or is not positive.
+/// does any value that cannot be parsed or is not a finite positive number, so
+/// `inf`, `nan`, and overflow-scale input fall back to unlimited like any
+/// other invalid value instead of clamping to a hard cap.
 pub fn parse_rate(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.is_empty() || s == "-" {
@@ -173,7 +175,7 @@ pub fn parse_rate(s: &str) -> Option<u32> {
         _ => (s, 1.0),
     };
     let value: f64 = num.trim().parse().ok()?;
-    if value <= 0.0 {
+    if !value.is_finite() || value <= 0.0 {
         return None;
     }
     let bytes = (value * mult).round();
@@ -338,6 +340,18 @@ mod tests {
         assert_eq!(parse_rate("-"), None);
         assert_eq!(parse_rate("fast"), None);
         assert_eq!(parse_rate("0"), None);
+    }
+
+    #[test]
+    fn non_finite_rates_fall_back_to_unlimited() {
+        // Any of these used to clamp to u32::MAX, turning a typo into a hard
+        // 4 GiB/s cap instead of the unlimited fallback every other invalid
+        // value gets.
+        assert_eq!(parse_rate("inf"), None);
+        assert_eq!(parse_rate("nan"), None);
+        assert_eq!(parse_rate("1e999"), None);
+        assert_eq!(parse_rate("1e999G"), None);
+        assert_eq!(parse_rate("-inf"), None);
     }
 
     #[test]

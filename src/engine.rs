@@ -537,7 +537,7 @@ const LISTEN_FAMILIES: [IpAddr; 2] = [
 /// where it used to walk a port range itself. kist keeps its configured range
 /// meaningful by probing it here, and falls back to an OS-assigned port so a
 /// port clash costs the preferred port rather than preventing startup.
-fn resolve_listen_addr(ports: std::ops::Range<u16>) -> (SocketAddr, Option<String>) {
+fn resolve_listen_addr(ports: std::ops::RangeInclusive<u16>) -> (SocketAddr, Option<String>) {
     for ip in LISTEN_FAMILIES {
         if let Some(addr) = ports
             .clone()
@@ -549,8 +549,8 @@ fn resolve_listen_addr(ports: std::ops::Range<u16>) -> (SocketAddr, Option<Strin
     }
     let warning = format!(
         "ports {}-{} are unavailable, letting the OS choose the peer port",
-        ports.start,
-        ports.end.saturating_sub(1)
+        ports.start(),
+        ports.end()
     );
     for ip in LISTEN_FAMILIES {
         let any = SocketAddr::new(ip, 0);
@@ -561,7 +561,7 @@ fn resolve_listen_addr(ports: std::ops::Range<u16>) -> (SocketAddr, Option<Strin
     // Nothing binds at all; hand back the configured port so librqbit reports
     // the real reason rather than kist guessing at it.
     (
-        SocketAddr::new(LISTEN_FAMILIES[0], ports.start),
+        SocketAddr::new(LISTEN_FAMILIES[0], *ports.start()),
         Some(warning),
     )
 }
@@ -1222,9 +1222,9 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        let (addr, warning) = resolve_listen_addr(port..port + 4);
+        let (addr, warning) = resolve_listen_addr(port..=port + 3);
         assert!(
-            (port..port + 4).contains(&addr.port()),
+            (port..=port + 3).contains(&addr.port()),
             "expected a port from the range, got {addr}"
         );
         assert!(warning.is_none(), "a usable range must not warn");
@@ -1236,7 +1236,7 @@ mod tests {
         // The listener is dual-stack, so it blocks both families kist tries.
         let held = std::net::TcpListener::bind("[::]:0").unwrap();
         let port = held.local_addr().unwrap().port();
-        let range = port..port + 1;
+        let range = port..=port;
 
         let (addr, warning) = resolve_listen_addr(range.clone());
         assert!(
@@ -1246,6 +1246,35 @@ mod tests {
         assert!(
             warning.is_some_and(|w| w.contains("unavailable")),
             "falling back to another port must be reported"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn the_unavailable_range_warning_names_the_full_range() {
+        // Two adjacent free ports, both held by dual-stack listeners, so the
+        // two-port range is fully occupied and no probe anywhere inside it
+        // can succeed. A taken neighbor just means another ephemeral pair.
+        let (start, held) = loop {
+            let first = std::net::TcpListener::bind("[::]:0").unwrap();
+            let port = first.local_addr().unwrap().port();
+            if port == u16::MAX {
+                continue;
+            }
+            match std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port + 1)) {
+                Ok(second) => break (port, (first, second)),
+                Err(_) => drop(first),
+            }
+        };
+
+        let (addr, warning) = resolve_listen_addr(start..=(start + 1));
+        if warning.is_none() {
+            panic!("no warning; a probe bound {addr:?} with held {held:?}");
+        }
+        let warning = warning.expect("a fully occupied range must warn");
+        assert!(
+            warning.contains(&format!("ports {}-{}", start, start + 1)),
+            "the warning must name the whole inclusive range, got {warning:?}"
         );
         drop(held);
     }
