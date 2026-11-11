@@ -125,14 +125,21 @@ impl Engine {
     }
 
     /// Add a torrent from a magnet link, `.torrent` file path, or URL.
-    pub async fn add(&self, source: String) -> Result<()> {
+    pub async fn add(&self, source: String) -> Result<AddOutcome> {
         let add = AddTorrent::from_cli_argument(&source)
             .with_context(|| format!("invalid torrent source: {source:?}"))?;
-        self.session
+        let response = self
+            .session
             .add_torrent(add, None)
             .await
             .with_context(|| format!("failed to add torrent: {source}"))?;
-        Ok(())
+        Ok(match response {
+            AddTorrentResponse::Added(..) => AddOutcome::Added,
+            AddTorrentResponse::AlreadyManaged(..) => AddOutcome::AlreadyManaged,
+            // A plain add never asks for list-only mode, so this reply cannot
+            // occur here.
+            AddTorrentResponse::ListOnly(_) => AddOutcome::Added,
+        })
     }
 
     /// Add a torrent with explicit options: start paused, an alternate output
@@ -143,7 +150,7 @@ impl Engine {
         paused: bool,
         output_folder: Option<String>,
         only_files: Option<Vec<usize>>,
-    ) -> Result<()> {
+    ) -> Result<AddOutcome> {
         let add = AddTorrent::from_cli_argument(&source)
             .with_context(|| format!("invalid torrent source: {source:?}"))?;
         let opts = AddTorrentOptions {
@@ -152,11 +159,17 @@ impl Engine {
             only_files,
             ..Default::default()
         };
-        self.session
+        let response = self
+            .session
             .add_torrent(add, Some(opts))
             .await
             .with_context(|| format!("failed to add torrent: {source}"))?;
-        Ok(())
+        Ok(match response {
+            AddTorrentResponse::Added(..) => AddOutcome::Added,
+            AddTorrentResponse::AlreadyManaged(..) => AddOutcome::AlreadyManaged,
+            // An optioned add never asks for list-only mode either.
+            AddTorrentResponse::ListOnly(_) => AddOutcome::Added,
+        })
     }
 
     /// List the files of a torrent source without adding or downloading it.
@@ -317,6 +330,7 @@ impl Engine {
             .unwrap_or_default();
 
         Some(DetailSnapshot {
+            id,
             infohash,
             state: to_row_state(stats.state),
             total_bytes: stats.total_bytes,
@@ -815,6 +829,31 @@ pub struct PreviewOutcome {
     pub error: Option<String>,
 }
 
+/// What an add of a source turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// A new torrent joined the session.
+    Added,
+    /// The session already manages this source; nothing changed.
+    AlreadyManaged,
+}
+
+/// The status line an add outcome becomes, plus whether it is an error.
+///
+/// A plain re-add is a no-op success. An optioned re-add applied none of the
+/// options the user asked for (librqbit never consults them for a source it
+/// already manages), so that must be an error to notice.
+pub fn add_status(outcome: AddOutcome, optioned: bool) -> (String, bool) {
+    match (outcome, optioned) {
+        (AddOutcome::AlreadyManaged, false) => ("already in list".to_string(), false),
+        (AddOutcome::AlreadyManaged, true) => (
+            "already in list; the options were not applied".to_string(),
+            true,
+        ),
+        (AddOutcome::Added, _) => ("added torrent".to_string(), false),
+    }
+}
+
 /// A discrete status notification published by the engine for the UI.
 pub struct EngineStatus {
     /// Human-readable message, already formatted for display.
@@ -931,12 +970,17 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                             });
                         }
                         // Adds keep an abort handle so they can be cancelled
-                        // while metadata is still resolving.
+                        // while metadata is still resolving. A re-add for the
+                        // same source aborts the displaced task first, so at
+                        // most one live add per source can report anything.
                         Command::Add(source) => {
                             let engine = engine.clone();
                             let snapshot_tx = snapshot_tx.clone();
                             let status_tx = status_tx.clone();
                             let cmd = Command::Add(source.clone());
+                            // Displace before spawning so the old task is
+                            // aborted before the replacement can start.
+                            displace_add(&mut add_tasks, &source);
                             let task = tokio::spawn(async move {
                                 if let Some(status) = handle_command(&engine, cmd).await {
                                     let _ = status_tx.send(status);
@@ -957,16 +1001,25 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
                             let snapshot_tx = snapshot_tx.clone();
                             let status_tx = status_tx.clone();
                             let key = source.clone();
+                            displace_add(&mut add_tasks, &key);
                             let task = tokio::spawn(async move {
-                                let result = engine
-                                    .add_with_options(source.clone(), paused, output_folder, only_files)
+                                let outcome = engine
+                                    .add_with_options(
+                                        source.clone(),
+                                        paused,
+                                        output_folder,
+                                        only_files,
+                                    )
                                     .await;
-                                let status = match result {
-                                    Ok(_) => EngineStatus {
-                                        message: "added torrent".to_string(),
-                                        is_error: false,
-                                        finished_add: Some(source),
-                                    },
+                                let status = match outcome {
+                                    Ok(outcome) => {
+                                        let (message, is_error) = add_status(outcome, true);
+                                        EngineStatus {
+                                            message,
+                                            is_error,
+                                            finished_add: Some(source),
+                                        }
+                                    }
                                     Err(e) => EngineStatus {
                                         message: error::to_status_line(&e),
                                         is_error: true,
@@ -1036,6 +1089,19 @@ pub fn spawn(engine: Arc<Engine>, refresh: Duration) -> EngineLink {
     }
 }
 
+/// Abort the in-flight add for a source, if one is still running.
+///
+/// A re-add displaces the earlier task: aborting it before the replacement
+/// starts guarantees at most one live add per source, and the displaced task
+/// can never send an outcome (or a stale snapshot) afterwards.
+fn displace_add(add_tasks: &mut HashMap<String, AbortHandle>, source: &str) {
+    if let Some(handle) = add_tasks.remove(source)
+        && !handle.is_finished()
+    {
+        handle.abort();
+    }
+}
+
 /// Apply a single action command, returning a status message if one should be shown.
 async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
     let mut finished_add = None;
@@ -1044,7 +1110,7 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
             let result = engine
                 .add(source.clone())
                 .await
-                .map(|_| "added torrent".to_string());
+                .map(|outcome| add_status(outcome, false).0);
             finished_add = Some(source);
             result
         }
@@ -1100,6 +1166,53 @@ async fn handle_command(engine: &Engine, cmd: Command) -> Option<EngineStatus> {
 mod tests {
     use super::*;
     use librqbit::Magnet;
+
+    #[test]
+    fn add_status_reports_each_outcome_honestly() {
+        assert_eq!(add_status(AddOutcome::Added, false).0, "added torrent");
+        assert!(!add_status(AddOutcome::Added, true).1);
+
+        // A plain re-add is a no-op success.
+        let (message, is_error) = add_status(AddOutcome::AlreadyManaged, false);
+        assert!(!is_error);
+        assert_eq!(message, "already in list");
+
+        // An optioned re-add applied nothing the user asked for, so it must
+        // be seen.
+        let (message, is_error) = add_status(AddOutcome::AlreadyManaged, true);
+        assert!(is_error);
+        assert!(message.contains("already in list"));
+        assert!(message.contains("not applied"));
+    }
+
+    #[test]
+    fn displacing_an_add_aborts_the_earlier_task() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut add_tasks: HashMap<String, AbortHandle> = HashMap::new();
+            let displaced = tokio::spawn(std::future::pending::<()>());
+            add_tasks.insert("magnet:one".to_string(), displaced.abort_handle());
+
+            // The re-add displaces the running task and leaves exactly one
+            // live handle for the source.
+            displace_add(&mut add_tasks, "magnet:one");
+            let replacement = tokio::spawn(std::future::pending::<()>());
+            add_tasks.insert("magnet:one".to_string(), replacement.abort_handle());
+            assert_eq!(add_tasks.len(), 1);
+
+            // Awaiting drives the runtime until the task completes, and the
+            // only way it completes here is cancellation. The timeout keeps a
+            // regression that drops the abort a failure, not a hang.
+            let outcome = tokio::time::timeout(Duration::from_secs(5), displaced).await;
+            assert!(
+                outcome.is_ok_and(|r| r.is_err_and(|e| e.is_cancelled())),
+                "the displaced task must be cancelled"
+            );
+        });
+    }
 
     #[test]
     fn listen_addr_uses_the_configured_range_when_free() {

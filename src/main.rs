@@ -158,7 +158,10 @@ fn run_ui(
 /// Send the commands produced by an [`Action`] to the engine.
 fn apply_action(action: &Action, commands: &tokio::sync::mpsc::Sender<Command>) {
     for command in &action.commands {
-        let _ = commands.try_send(command.clone());
+        // The UI loop is a plain thread, so a full queue waits for the engine
+        // to drain instead of dropping the command silently. A closed channel
+        // (quit) returns immediately and is ignored.
+        let _ = commands.blocking_send(command.clone());
     }
 }
 
@@ -257,5 +260,33 @@ mod tests {
         let result = std::panic::catch_unwind(|| panic!("boom"));
         assert!(result.is_err());
         assert!(called.load(Ordering::SeqCst), "previous hook must run");
+    }
+
+    #[test]
+    fn a_full_queue_waits_instead_of_dropping_commands() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Command>(4);
+        let action = Action {
+            commands: (0..40).map(Command::Pause).collect(),
+            quit: false,
+        };
+
+        // A busy engine draining one command per tick: a try_send sender
+        // would discard everything past the bound.
+        let drainer = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Some(cmd) = rx.blocking_recv() {
+                got.push(cmd);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            got
+        });
+
+        apply_action(&action, &tx);
+        drop(tx);
+        let got = drainer.join().unwrap();
+
+        assert_eq!(got.len(), 40, "every command arrives, none is dropped");
+        assert!(matches!(got.first(), Some(Command::Pause(0))));
+        assert!(matches!(got.last(), Some(Command::Pause(39))));
     }
 }

@@ -46,6 +46,7 @@ fn populated() -> App {
 
 fn detail() -> DetailSnapshot {
     DetailSnapshot {
+        id: 0,
         infohash: "abba124763b987366fe66f8461a48e4c8d4482d2".to_string(),
         state: RowState::Live,
         total_bytes: 1024 * 1000,

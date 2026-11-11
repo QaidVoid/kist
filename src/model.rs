@@ -202,6 +202,10 @@ pub struct WebSeedRow {
 /// data does not increase the cost of the regular list refresh.
 #[derive(Debug, Clone)]
 pub struct DetailSnapshot {
+    /// Id of the torrent this snapshot was fetched for, so the pane can tell
+    /// a snapshot for its torrent from one still arriving for the previous
+    /// torrent during a refocus.
+    pub id: usize,
     pub infohash: String,
     pub state: RowState,
     pub total_bytes: u64,

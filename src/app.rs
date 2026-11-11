@@ -703,8 +703,17 @@ impl App {
 
     /// Replace the detail snapshot for the pane, feeding the speed history and
     /// per-peer speed buffers (which reset when the target torrent changes).
+    ///
+    /// A snapshot for another torrent is ignored: during a refocus window the
+    /// previous torrent's snapshot still arrives, and applying it would mix its
+    /// file indices with the newly targeted id.
     pub fn set_detail(&mut self, detail: Option<DetailSnapshot>) {
         let id = self.detail_target_id();
+        if let Some(d) = &detail
+            && id != Some(d.id)
+        {
+            return;
+        }
         if id != self.history_id {
             self.detail_down_history.clear();
             self.detail_up_history.clear();
@@ -1531,6 +1540,9 @@ impl App {
         let Some(detail) = &self.detail else {
             return Action::none();
         };
+        if detail.id != id {
+            return Action::none();
+        }
         match detail.web_seeds.get(self.detail_seed_selected) {
             Some(seed) => Action::cmd(Command::DetachWebSeed {
                 id,
@@ -1578,6 +1590,9 @@ impl App {
         let Some(detail) = &self.detail else {
             return Action::none();
         };
+        if detail.id != id {
+            return Action::none();
+        }
         if detail.files.is_empty() {
             return Action::none();
         }
@@ -2040,6 +2055,7 @@ mod tests {
 
     fn detail_with_files(id: usize, included: &[bool]) -> DetailSnapshot {
         DetailSnapshot {
+            id,
             infohash: format!("h{id}"),
             state: RowState::Live,
             total_bytes: 100,
@@ -2151,6 +2167,49 @@ mod tests {
         a.detail = Some(detail_with_files(7, &[true, false, false]));
         a.detail_file_selected = 0;
         let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(action.commands.is_empty());
+    }
+
+    #[test]
+    fn a_stale_detail_snapshot_is_ignored_during_a_refocus() {
+        let mut a = App::new();
+        a.mode = Mode::Detail { id: 1 };
+        a.set_detail(Some(detail_with_files(1, &[true, true])));
+
+        // Refocus: the pane targets torrent 2 before its snapshot arrives.
+        a.mode = Mode::Detail { id: 2 };
+
+        // The previous torrent's snapshot lands first and must be ignored,
+        // not mixed into the pane that now targets torrent 2.
+        a.set_detail(Some(detail_with_files(1, &[false, false])));
+        let held = a.detail.as_ref().unwrap();
+        assert_eq!(held.id, 1);
+        assert!(
+            held.files.iter().all(|f| f.included),
+            "the stale snapshot was not applied"
+        );
+
+        // The matching snapshot fills the pane in on the next tick.
+        a.set_detail(Some(detail_with_files(2, &[true])));
+        assert_eq!(a.detail.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn detail_actions_against_a_mismatched_snapshot_send_nothing() {
+        let mut a = App::new();
+        a.mode = Mode::Detail { id: 2 };
+        // The pane still holds torrent 1's snapshot (refocus window).
+        a.detail = Some(detail_with_files(1, &[true, true]));
+        a.detail_tab = DetailTab::Files;
+        a.detail_file_selected = 0;
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(action.commands.is_empty());
+
+        // The same guard protects the Sources tab detach.
+        a.detail = Some(detail_with_seeds(1, &["https://a.example/"]));
+        a.detail_tab = DetailTab::Sources;
+        a.detail_seed_selected = 0;
+        let action = a.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert!(action.commands.is_empty());
     }
 
