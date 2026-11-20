@@ -1,4 +1,17 @@
 
+## [0.2.1](https://github.com/QaidVoid/kist/compare/v0.2.0...v0.2.1) - 2026-11-20
+
+### 🐛 Bug Fixes
+
+- *(config)* Reject non-finite rates and keep port 65535 - ([f66b7a1](https://github.com/QaidVoid/kist/commit/f66b7a1fd0406997a3c63b6bfc6edf2f2aaf72f5))
+- *(engine)* Backpressure, add dedup, and detail anchoring - ([fd78066](https://github.com/QaidVoid/kist/commit/fd7806699ed01afa63e354f28e33d86f1f6b87e7))
+- *(ui)* Key kinds, panic restore, status line, search sizing - ([e2240ce](https://github.com/QaidVoid/kist/commit/e2240ce227f3fa1404b4f1e277928611801ddf61))
+- Reconnect transient web seeds and quarantine bad state - ([68f68c7](https://github.com/QaidVoid/kist/commit/68f68c7540efa73b7fab380c7cf6ccaf990d1279))
+
+### ⚙️ Miscellaneous Tasks
+
+- Add lint and test workflow for linux and windows - ([e5d89e5](https://github.com/QaidVoid/kist/commit/e5d89e55d95e8d2aacc679e628cca24b437f3d23))
+
 ## [0.2.0](https://github.com/QaidVoid/kist/compare/v0.1.0...v0.2.0) - 2026-08-19
 
 ### ⛰️  Features
